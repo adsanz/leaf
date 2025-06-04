@@ -341,8 +341,11 @@ impl LogNormalizer {
     }
 
     fn is_nonsense_word(word: &str) -> bool {
-        let len: usize = word.len();
+        let len = word.len();
         if len > 20 {
+            return true;
+        }
+        if len < 3 {
             return true;
         }
         let digit_count = word.chars().filter(|c| c.is_ascii_digit()).count();
@@ -357,44 +360,12 @@ impl LogNormalizer {
         if alpha_count < len.div_ceil(2) {
             return true;
         }
-        // Optionally, filter out common stopwords (add more as needed)
-        matches!(
-            word,
-            "the"
-                | "and"
-                | "for"
-                | "has"
-                | "have"
-                | "with"
-                | "from"
-                | "that"
-                | "this"
-                | "was"
-                | "are"
-                | "but"
-                | "not"
-                | "can"
-                | "will"
-                | "all"
-                | "any"
-                | "api"
-                | "io"
-                | "it"
-                | "on"
-                | "in"
-                | "of"
-                | "to"
-                | "by"
-                | "as"
-                | "is"
-                | "be"
-                | "or"
-                | "if"
-                | "no"
-                | "because"
-                | "at"
-                | "an"
-        )
+        // Exclude words with high entropy (many unique characters, not dictionary-like)
+        let unique_chars = word.chars().collect::<std::collections::HashSet<_>>().len();
+        if len > 8 && unique_chars as f32 / len as f32 > 0.7 {
+            return true;
+        }
+        false
     }
 
     fn extract_words_and_normalized(&mut self, log_line: &str) -> (Vec<String>, String) {
