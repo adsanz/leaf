@@ -112,7 +112,13 @@ impl MmapStringPool {
 
             let id = self.id_to_offset.len();
             self.id_to_offset.push((self.current_offset, needed_space));
-            self.string_to_id.insert(s.to_string(), id);
+
+            // Only store shorter strings in the map to reduce memory usage
+            if s.len() < 1000 {
+                // Only intern strings shorter than 1KB
+                self.string_to_id.insert(s.to_string(), id);
+            }
+
             self.current_offset += needed_space;
 
             id
@@ -569,7 +575,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pb = ProgressBar::new(tasks.len() as u64);
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+                )
                 .unwrap()
                 .progress_chars("#>-"),
         );
@@ -579,34 +587,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Execute tasks with concurrency limit
+    // Execute tasks with concurrency limit and update progress bar in real-time
     let concurrent_stream = stream::iter(tasks).buffer_unordered(cli.fetch_limit);
 
-    let results: Vec<_> = concurrent_stream.collect().await;
+    let mut results_stream = concurrent_stream;
 
-    // Collect all successful results
-    for result in results {
+    // Process results as they come in to show real-time progress
+    while let Some(result) = results_stream.next().await {
         match result {
             Ok(Ok(log_entries)) => {
                 all_log_lines.extend(log_entries);
-                if let Some(ref pb) = fetch_progress {
-                    pb.inc(1);
-                }
             }
             Ok(Err(_)) => {
                 // Error already logged in the task
-                if let Some(ref pb) = fetch_progress {
-                    pb.inc(1);
-                }
             }
             Err(e) => {
                 if !cli.json {
                     eprintln!("Task error: {}", e);
                 }
-                if let Some(ref pb) = fetch_progress {
-                    pb.inc(1);
-                }
             }
+        }
+
+        // Update progress bar after each completed task
+        if let Some(ref pb) = fetch_progress {
+            pb.inc(1);
         }
     }
 
@@ -624,7 +628,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Apply filtering if filter strings are provided
     let filtered_logs = if !cli.filter.is_empty() {
         let original_count = all_log_lines.len();
-        
+
         // Create progress bar for filtering
         let filter_progress = if !cli.json {
             let pb = ProgressBar::new(original_count as u64);
@@ -645,16 +649,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .enumerate()
             .filter_map(|(i, (line, metadata))| {
                 if let Some(ref pb) = filter_progress {
-                    if i % 100 == 0 { // Update every 100 items to avoid too frequent updates
+                    if i % 100 == 0 {
+                        // Update every 100 items to avoid too frequent updates
                         pb.set_position(i as u64);
                     }
                 }
-                
+
                 let line_lower = line.to_lowercase();
-                let matches = cli.filter
+                let matches = cli
+                    .filter
                     .iter()
                     .any(|filter| line_lower.contains(&filter.to_lowercase()));
-                
+
                 if matches {
                     Some((line, metadata))
                 } else {
@@ -743,8 +749,8 @@ async fn cluster_logs_parallel(
         );
     }
 
-    // Create memory-mapped string pool (256MB initial capacity)
-    let string_pool = match MmapStringPool::new(256) {
+    // Create memory-mapped string pool (64MB initial capacity, smaller footprint)
+    let string_pool = match MmapStringPool::new(64) {
         Ok(pool) => Arc::new(Mutex::new(pool)),
         Err(e) => {
             if !json_mode {
@@ -758,10 +764,10 @@ async fn cluster_logs_parallel(
     };
 
     // Optimized batch size and worker count for better parallelism with large datasets
-    let batch_size = if logs.len() > 100_000 { 
+    let batch_size = if logs.len() > 100_000 {
         (logs.len() / 1000).max(500) // Minimum 500, scale with dataset size
-    } else { 
-        1000 
+    } else {
+        1000
     };
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get().min(16)) // Cap at 16 workers
@@ -789,7 +795,9 @@ async fn cluster_logs_parallel(
         let pb = ProgressBar::new(batches.len() as u64);
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+                )
                 .unwrap()
                 .progress_chars("#>-"),
         );
@@ -823,27 +831,14 @@ async fn cluster_logs_parallel(
 
             while let Some(batch) = {
                 // Try to get work with proper guard scoping
-                let batch_option = {
+                {
                     let mut rx_guard = work_rx.lock().unwrap();
-                    match rx_guard.try_recv() {
-                        Ok(batch) => Some(batch),
-                        Err(mpsc::error::TryRecvError::Empty) => None,
-                        Err(mpsc::error::TryRecvError::Disconnected) => None,
-                    }
-                }; // Guard is dropped here
-                
-                match batch_option {
-                    Some(batch) => Some(batch),
-                    None => {
-                        // No work available, yield to other tasks and add small delay
-                        tokio::task::yield_now().await;
-                        tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
-                        None
-                    }
+                    rx_guard.try_recv().ok()
                 }
             } {
                 batches_processed += 1;
-                if !json_mode && worker_id == 0 { // Only log from worker 0 to reduce noise
+                if !json_mode && worker_id == 0 {
+                    // Only log from worker 0 to reduce noise
                     println!(
                         "Worker {} processing batch {} of {} items",
                         worker_id,
@@ -860,7 +855,8 @@ async fn cluster_logs_parallel(
                         &mut normalizer,
                         similarity_threshold,
                         &string_pool,
-                    ).await;
+                    )
+                    .await;
                 }
 
                 // Update progress bar
@@ -919,7 +915,13 @@ async fn cluster_logs_parallel(
     };
 
     // Merge similar clusters across workers using the original merge function
-    let merged_clusters = merge_clusters(all_clusters, similarity_threshold, &string_pool, merge_progress.as_ref()).await;
+    let merged_clusters = merge_clusters(
+        all_clusters,
+        similarity_threshold,
+        &string_pool,
+        merge_progress.as_ref(),
+    )
+    .await;
 
     if let Some(pb) = merge_progress {
         pb.finish_with_message("Cluster merging complete!");
@@ -936,7 +938,7 @@ async fn cluster_logs_parallel(
     let string_pool_guard = string_pool.lock().unwrap();
     let result_clusters: Vec<LogCluster> = merged_clusters
         .iter()
-        .map(|opt_cluster| opt_cluster.to_log_cluster(&*string_pool_guard))
+        .map(|opt_cluster| opt_cluster.to_log_cluster(&string_pool_guard))
         .collect();
     drop(string_pool_guard);
 
@@ -953,8 +955,6 @@ async fn cluster_logs_parallel(
 
     sorted_clusters
 }
-
-
 
 // Merge clusters from different workers
 async fn merge_clusters(
@@ -1053,8 +1053,8 @@ async fn process_log_item(
     let mut max_similarity = 0.0;
 
     // Limit cluster checking for performance
-    let check_limit = if clusters.len() > 50 {
-        50 // More aggressive limiting in parallel mode
+    let check_limit = if clusters.len() > 25 {
+        25 // More aggressive limiting for memory efficiency
     } else {
         clusters.len()
     };
@@ -1063,7 +1063,7 @@ async fn process_log_item(
     let string_pool_guard = string_pool.lock().unwrap();
 
     for (i, cluster) in clusters.iter().enumerate().take(check_limit) {
-        let similarity = cluster.similarity_to(&normalized_text, &*string_pool_guard);
+        let similarity = cluster.similarity_to(&normalized_text, &string_pool_guard);
         if similarity > max_similarity {
             max_similarity = similarity;
             if similarity >= similarity_threshold {
@@ -1076,25 +1076,23 @@ async fn process_log_item(
 
     if let Some(index) = best_match_index {
         let mut string_pool_guard = string_pool.lock().unwrap();
-        clusters[index].add_member(&log_line, metadata, &mut *string_pool_guard);
+        clusters[index].add_member(&log_line, metadata, &mut string_pool_guard);
     } else {
         // Limit total clusters to prevent memory issues
-        if clusters.len() < 100 {
-            // Lower limit per worker
+        if clusters.len() < 50 {
+            // Lower limit per worker for memory efficiency
             let mut string_pool_guard = string_pool.lock().unwrap();
             let new_cluster = OptimizedLogCluster::new(
                 &log_line,
                 words,
                 normalized_text,
                 metadata,
-                &mut *string_pool_guard,
+                &mut string_pool_guard,
             );
             clusters.push(new_cluster);
         }
     }
 }
-
-
 
 // Fallback clustering function (original implementation)
 fn cluster_logs_fallback(
@@ -1131,7 +1129,9 @@ fn cluster_logs(
         let pb = ProgressBar::new(logs.len() as u64);
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+                )
                 .unwrap()
                 .progress_chars("#>-"),
         );
@@ -1159,7 +1159,8 @@ fn cluster_logs(
 
         // Update progress bar
         if let Some(ref pb) = clustering_progress {
-            if processed % 10 == 0 { // Update every 10 items to avoid too frequent updates
+            if processed % 10 == 0 {
+                // Update every 10 items to avoid too frequent updates
                 pb.set_position(processed as u64);
             }
         }
