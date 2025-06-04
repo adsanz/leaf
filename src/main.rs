@@ -193,43 +193,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pod_name = pod.metadata.name.unwrap_or_default();
         let namespace = pod.metadata.namespace.unwrap_or_default();
 
-        if let Some(ref containers) = pod.spec.and_then(|s| s.containers.into_iter().next()) {
-            let container_name = &containers.name;
+        // Process all containers in the pod
+        if let Some(containers) = pod.spec.as_ref().map(|s| &s.containers) {
+            for container in containers {
+                let container_name = &container.name;
 
-            if !cli.json {
-                println!(
-                    "Fetching logs from pod: {}, container: {}",
-                    pod_name, container_name
-                );
-            }
-
-            let mut log_params = LogParams::default();
-            if let Some(ref since_str) = cli.since {
-                if let Ok(since_time) = DateTime::parse_from_rfc3339(since_str) {
-                    log_params.since_time = Some(since_time.with_timezone(&Utc));
+                if !cli.json {
+                    println!(
+                        "Fetching logs from pod: {}, container: {}",
+                        pod_name, container_name
+                    );
                 }
-            }
+                let mut log_params = LogParams {
+                    container: Some(container_name.clone()),
+                    ..Default::default()
+                };
 
-            match pods.logs(&pod_name, &log_params).await {
-                Ok(logs) => {
-                    let lines: Vec<String> = logs.lines().map(|s| s.to_string()).collect();
-                    if !cli.json {
-                        println!("  Fetched {} lines", lines.len());
-                    }
-
-                    // Add lines with metadata
-                    for line in lines {
-                        let metadata = LogMetadata {
-                            namespace: namespace.clone(),
-                            pod: pod_name.clone(),
-                            container: container_name.clone(),
-                        };
-                        all_log_lines.push((line, metadata));
+                if let Some(ref since_str) = cli.since {
+                    if let Ok(since_time) = DateTime::parse_from_rfc3339(since_str) {
+                        log_params.since_time = Some(since_time.with_timezone(&Utc));
                     }
                 }
-                Err(e) => {
-                    if !cli.json {
-                        eprintln!("Error fetching logs for pod {}: {}", pod_name, e);
+
+                match pods.logs(&pod_name, &log_params).await {
+                    Ok(logs) => {
+                        let lines: Vec<String> = logs.lines().map(|s| s.to_string()).collect();
+                        if !cli.json {
+                            println!("  Fetched {} lines", lines.len());
+                        }
+
+                        // Add lines with metadata
+                        for line in lines {
+                            let metadata = LogMetadata {
+                                namespace: namespace.clone(),
+                                pod: pod_name.clone(),
+                                container: container_name.clone(),
+                            };
+                            all_log_lines.push((line, metadata));
+                        }
+                    }
+                    Err(e) => {
+                        if !cli.json {
+                            eprintln!("Error fetching logs for pod {}: {}", pod_name, e);
+                        }
                     }
                 }
             }
