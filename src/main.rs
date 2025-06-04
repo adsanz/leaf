@@ -8,10 +8,11 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::api::{ListParams, LogParams};
 use kube::{Api, Client};
 use memmap2::{MmapMut, MmapOptions};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{Seek, SeekFrom};
-use std::sync::{Arc, Mutex};
 use textdistance::str::sorensen_dice;
 use tokio::task;
 
@@ -152,6 +153,7 @@ impl MmapStringPool {
 }
 
 // Thread-safe string pool wrapper
+// type SharedStringPool = Arc<Mutex<MmapStringPool>>;
 type SharedStringPool = Arc<Mutex<MmapStringPool>>;
 
 // Optimized LogCluster using string pool IDs
@@ -849,7 +851,7 @@ async fn cluster_logs_parallel(
 
                 // Update progress bar directly after each batch
                 if let Some(ref pb_mutex) = batch_progress {
-                    let pb = pb_mutex.lock().unwrap();
+                    let pb = pb_mutex.lock();
                     pb.inc(1);
                 }
             }
@@ -879,7 +881,7 @@ async fn cluster_logs_parallel(
 
     // Finish batch processing progress bar
     if let Some(pb_mutex) = batch_progress {
-        let pb = pb_mutex.lock().unwrap();
+        let pb = pb_mutex.lock();
         pb.finish_with_message("Batch processing complete!");
     }
 
@@ -923,7 +925,7 @@ async fn cluster_logs_parallel(
     }
 
     // Convert optimized clusters back to regular clusters
-    let string_pool_guard = string_pool.lock().unwrap();
+    let string_pool_guard = string_pool.lock();
     let result_clusters: Vec<LogCluster> = merged_clusters
         .iter()
         .map(|opt_cluster| opt_cluster.to_log_cluster(&string_pool_guard))
@@ -962,7 +964,7 @@ async fn merge_clusters(
 
     for (i, cluster) in clusters.into_iter().enumerate() {
         let mut found_merge = false;
-        let string_pool_guard = string_pool.lock().unwrap();
+        let string_pool_guard = string_pool.lock();
 
         if let Some(cluster_text) = string_pool_guard.get_string(cluster.normalized_text_id) {
             // Check if this cluster can be merged with any existing one
@@ -1048,7 +1050,7 @@ async fn process_log_item(
     };
 
     // Lock the string pool for similarity checks
-    let string_pool_guard = string_pool.lock().unwrap();
+    let string_pool_guard = string_pool.lock();
 
     for (i, cluster) in clusters.iter().enumerate().take(check_limit) {
         let similarity = cluster.similarity_to(&normalized_text, &string_pool_guard);
@@ -1063,13 +1065,13 @@ async fn process_log_item(
     drop(string_pool_guard);
 
     if let Some(index) = best_match_index {
-        let mut string_pool_guard = string_pool.lock().unwrap();
+        let mut string_pool_guard = string_pool.lock();
         clusters[index].add_member(&log_line, metadata, &mut string_pool_guard);
     } else {
         // Limit total clusters to prevent memory issues
         if clusters.len() < 50 {
             // Lower limit per worker for memory efficiency
-            let mut string_pool_guard = string_pool.lock().unwrap();
+            let mut string_pool_guard = string_pool.lock();
             let new_cluster = OptimizedLogCluster::new(
                 &log_line,
                 words,

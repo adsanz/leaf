@@ -1128,6 +1128,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "memmap2",
+ "parking_lot",
  "serde",
  "serde_json",
  "tempfile",
