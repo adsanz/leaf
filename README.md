@@ -129,6 +129,9 @@ The compiled binary will be available at `target/release/leaf`.
 # Filter logs containing multiple keywords (OR condition)
 ./leaf --filter error,warn,exception
 
+# Limit JSON output to 5 members per cluster for large datasets
+./leaf --json --member-limit 5
+
 # Combine filters for focused analysis
 ./leaf --namespace production --filter error,timeout --threshold 0.8
 ```
@@ -143,6 +146,7 @@ The compiled binary will be available at `target/release/leaf`.
 | `--json` | `-j` | Output results as JSON | false |
 | `--since` | `-s` | Filter logs since RFC3339 timestamp | None |
 | `--filter` | `-f` | Filter logs containing specific strings (comma-separated, case-insensitive) | None |
+| `--member-limit` | `-m` | Limit number of log members in JSON output (0 = unlimited) | 0 |
 
 ### Examples
 
@@ -155,6 +159,9 @@ The compiled binary will be available at `target/release/leaf`.
 
 # Get recent error and warning logs as JSON for processing
 ./leaf --filter error,warn --since "2024-06-04T09:00:00Z" --json
+
+# Limit output size for large clusters
+./leaf --json --member-limit 10 --filter error
 
 # High-sensitivity clustering for debugging specific issues
 ./leaf -n staging --filter timeout,connection --threshold 0.9

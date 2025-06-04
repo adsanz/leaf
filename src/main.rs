@@ -32,6 +32,13 @@ struct Cli {
         value_delimiter = ','
     )]
     filter: Vec<String>,
+    #[clap(
+        short = 'm',
+        long,
+        help = "Limit the number of log members included in JSON output (default: unlimited)",
+        default_value = "0"
+    )]
+    member_limit: usize,
 }
 
 // Ultra-fast log normalizer using word extraction and string normalization
@@ -270,7 +277,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let clusters = cluster_logs(filtered_logs, cli.threshold, &mut normalizer, cli.json);
 
     if cli.json {
-        let json_output = serde_json::to_string_pretty(&clusters)?;
+        // Apply member limit if specified for JSON output
+        let limited_clusters: Vec<LogCluster> = if cli.member_limit > 0 {
+            clusters
+                .into_iter()
+                .map(|mut cluster| {
+                    if cluster.members.len() > cli.member_limit {
+                        cluster.members.truncate(cli.member_limit);
+                    }
+                    cluster
+                })
+                .collect()
+        } else {
+            clusters
+        };
+
+        let json_output = serde_json::to_string_pretty(&limited_clusters)?;
         println!("{}", json_output);
     } else {
         println!("\n--- Log Clusters ---");
