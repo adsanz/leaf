@@ -1,7 +1,7 @@
 // Kubernetes log clustering with sorensen_dice similarity
+use ahash::{AHashMap, AHashSet};
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use crossbeam_channel;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use k8s_openapi::api::core::v1::Pod;
@@ -9,14 +9,13 @@ use kube::api::{ListParams, LogParams};
 use kube::{Api, Client};
 use memmap2::{MmapMut, MmapOptions};
 use parking_lot::Mutex;
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
 use std::io::{Seek, SeekFrom};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 use textdistance::str::sorensen_dice;
 use tokio::task;
-use std::time::Instant;
 
 #[derive(Parser)]
 #[clap(
@@ -63,7 +62,7 @@ struct MmapStringPool {
     #[allow(dead_code)] // Keeps the file alive for the memory mapping
     file: std::fs::File,
     mmap: Option<MmapMut>,
-    string_to_id: HashMap<String, usize>,
+    string_to_id: AHashMap<String, usize>,
     id_to_offset: Vec<(usize, usize)>, // (offset, length) pairs
     current_offset: usize,
     capacity: usize,
@@ -86,7 +85,7 @@ impl MmapStringPool {
         Ok(MmapStringPool {
             file,
             mmap: Some(mmap),
-            string_to_id: HashMap::new(),
+            string_to_id: AHashMap::new(),
             id_to_offset: Vec::new(),
             current_offset: 0,
             capacity,
@@ -119,9 +118,8 @@ impl MmapStringPool {
             let id = self.id_to_offset.len();
             self.id_to_offset.push((self.current_offset, needed_space));
 
-            // Only store shorter strings in the map to reduce memory usage
-            if s.len() < 1000 {
-                // Only intern strings shorter than 1KB
+            // Only intern short strings (e.g., <256 bytes) to reduce memory usage
+            if s.len() < 256 {
                 self.string_to_id.insert(s.to_string(), id);
             }
 
@@ -168,10 +166,10 @@ struct OptimizedLogCluster {
     normalized_text_id: usize,
     word_ids: Vec<usize>,
     member_ids: Vec<usize>,
-    member_ids_set: HashSet<usize>, // O(1) deduplication lookup
+    member_ids_set: AHashSet<usize>, // O(1) deduplication lookup
     count: usize,
     sources: Vec<PackedLogMetadata>,
-    sources_set: HashSet<(usize, usize, usize)>, // O(1) source deduplication lookup
+    sources_set: AHashSet<(usize, usize, usize)>, // O(1) source deduplication lookup
 }
 
 // Packed metadata for memory efficiency
@@ -194,7 +192,7 @@ impl OptimizedLogCluster {
         let normalized_text_id = string_pool.intern_string(&normalized_text);
         let word_ids: Vec<usize> = words.iter().map(|w| string_pool.intern_string(w)).collect();
         let member_ids = vec![representative_id];
-        let mut member_ids_set = HashSet::new();
+        let mut member_ids_set = AHashSet::new();
         member_ids_set.insert(representative_id);
 
         let packed_metadata = PackedLogMetadata {
@@ -203,7 +201,7 @@ impl OptimizedLogCluster {
             container_id: string_pool.intern_string(&metadata.container),
         };
 
-        let mut sources_set = HashSet::new();
+        let mut sources_set = AHashSet::new();
         sources_set.insert((
             packed_metadata.namespace_id,
             packed_metadata.pod_id,
@@ -298,8 +296,8 @@ impl OptimizedLogCluster {
             .collect();
 
         // Build HashSets for performance
-        let members_set: HashSet<String> = members.iter().cloned().collect();
-        let sources_set: HashSet<(String, String, String)> = sources
+        let members_set: AHashSet<String> = members.iter().cloned().collect();
+        let sources_set: AHashSet<(String, String, String)> = sources
             .iter()
             .map(|s| (s.namespace.clone(), s.pod.clone(), s.container.clone()))
             .collect();
@@ -326,13 +324,13 @@ struct WorkItem {
 
 // Ultra-fast log normalizer using word extraction and string normalization
 struct LogNormalizer {
-    cache: HashMap<String, (Vec<String>, String)>,
+    cache: AHashMap<String, (Vec<String>, String)>,
 }
 
 impl LogNormalizer {
     fn new() -> Self {
         LogNormalizer {
-            cache: HashMap::new(),
+            cache: AHashMap::new(),
         }
     }
 
@@ -411,21 +409,21 @@ struct LogCluster {
     words: Vec<String>,
     members: Vec<String>,
     #[serde(skip)] // Skip serialization for performance sets
-    members_set: HashSet<String>, // O(1) deduplication lookup
+    members_set: AHashSet<String>, // O(1) deduplication lookup
     count: usize,
     sources: Vec<LogMetadata>,
     #[serde(skip)] // Skip serialization for performance sets
-    sources_set: HashSet<(String, String, String)>, // O(1) source deduplication lookup
+    sources_set: AHashSet<(String, String, String)>, // O(1) source deduplication lookup
 }
 
 impl LogCluster {
     fn new(log_line: String, normalizer: &mut LogNormalizer, metadata: LogMetadata) -> Self {
         let (words, normalized_text) = normalizer.extract_words_and_normalized(&log_line);
 
-        let mut members_set = HashSet::new();
+        let mut members_set = AHashSet::new();
         members_set.insert(log_line.clone());
 
-        let mut sources_set = HashSet::new();
+        let mut sources_set = AHashSet::new();
         sources_set.insert((
             metadata.namespace.clone(),
             metadata.pod.clone(),
