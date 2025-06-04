@@ -1,12 +1,14 @@
 // Kubernetes log clustering with jaccard similarity
 use chrono::{DateTime, Utc};
 use clap::Parser;
+use futures::stream::{self, StreamExt};
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{ListParams, LogParams};
 use kube::{Api, Client};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use textdistance::str::jaccard;
+use tokio::task;
 
 #[derive(Parser)]
 #[clap(
@@ -39,6 +41,12 @@ struct Cli {
         default_value = "0"
     )]
     member_limit: usize,
+    #[clap(
+        long,
+        help = "Maximum number of concurrent pod log fetches (default: 10)",
+        default_value = "10"
+    )]
+    fetch_limit: usize,
 }
 
 // Ultra-fast log normalizer using word extraction and string normalization
@@ -169,10 +177,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     let client = Client::try_default().await?;
-    let pods: Api<Pod> = if let Some(ref namespace) = cli.namespace {
-        Api::namespaced(client, namespace)
+
+    // Get pod list - use all namespaces if none specified
+    let pods_api: Api<Pod> = if let Some(ref namespace) = cli.namespace {
+        Api::namespaced(client.clone(), namespace)
     } else {
-        Api::all(client)
+        Api::all(client.clone())
     };
 
     let mut list_params = ListParams::default();
@@ -180,7 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         list_params = list_params.labels(label);
     }
 
-    let pod_list = pods.list(&list_params).await?;
+    let pod_list = pods_api.list(&list_params).await?;
 
     if !cli.json {
         println!("Found {} pods", pod_list.items.len());
@@ -189,6 +199,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut all_log_lines = Vec::new();
     let mut normalizer = LogNormalizer::new();
 
+    // Create tasks for concurrent log fetching
+    let mut tasks = Vec::new();
+
     for pod in pod_list.items {
         let pod_name = pod.metadata.name.unwrap_or_default();
         let namespace = pod.metadata.namespace.unwrap_or_default();
@@ -196,47 +209,94 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Process all containers in the pod
         if let Some(containers) = pod.spec.as_ref().map(|s| &s.containers) {
             for container in containers {
-                let container_name = &container.name;
+                let container_name = container.name.clone();
+                let client_clone = client.clone();
+                let pod_name_clone = pod_name.clone();
+                let namespace_clone = namespace.clone();
+                let since = cli.since.clone();
+                let json_mode = cli.json;
 
+                let task = task::spawn(async move {
+                    if !json_mode {
+                        println!(
+                            "Fetching logs from pod: {}, container: {}",
+                            pod_name_clone, container_name
+                        );
+                    }
+
+                    // Create namespace-specific client for log fetching
+                    let namespace_pods_api: Api<Pod> =
+                        Api::namespaced(client_clone, &namespace_clone);
+
+                    let mut log_params = LogParams {
+                        container: Some(container_name.clone()),
+                        ..Default::default()
+                    };
+
+                    if let Some(ref since_str) = since {
+                        if let Ok(since_time) = DateTime::parse_from_rfc3339(since_str) {
+                            log_params.since_time = Some(since_time.with_timezone(&Utc));
+                        }
+                    }
+
+                    match namespace_pods_api.logs(&pod_name_clone, &log_params).await {
+                        Ok(logs) => {
+                            let lines: Vec<String> = logs.lines().map(|s| s.to_string()).collect();
+                            if !json_mode {
+                                println!(
+                                    "  Fetched {} lines from {}/{}",
+                                    lines.len(),
+                                    pod_name_clone,
+                                    container_name
+                                );
+                            }
+
+                            // Create metadata for each log line
+                            let log_entries: Vec<(String, LogMetadata)> = lines
+                                .into_iter()
+                                .map(|line| {
+                                    let metadata = LogMetadata {
+                                        namespace: namespace_clone.clone(),
+                                        pod: pod_name_clone.clone(),
+                                        container: container_name.clone(),
+                                    };
+                                    (line, metadata)
+                                })
+                                .collect();
+
+                            Ok(log_entries)
+                        }
+                        Err(e) => {
+                            if !json_mode {
+                                eprintln!("Error fetching logs for pod {}: {}", pod_name_clone, e);
+                            }
+                            Err(e)
+                        }
+                    }
+                });
+
+                tasks.push(task);
+            }
+        }
+    }
+
+    // Execute tasks with concurrency limit
+    let concurrent_stream = stream::iter(tasks).buffer_unordered(cli.fetch_limit);
+
+    let results: Vec<_> = concurrent_stream.collect().await;
+
+    // Collect all successful results
+    for result in results {
+        match result {
+            Ok(Ok(log_entries)) => {
+                all_log_lines.extend(log_entries);
+            }
+            Ok(Err(_)) => {
+                // Error already logged in the task
+            }
+            Err(e) => {
                 if !cli.json {
-                    println!(
-                        "Fetching logs from pod: {}, container: {}",
-                        pod_name, container_name
-                    );
-                }
-                let mut log_params = LogParams {
-                    container: Some(container_name.clone()),
-                    ..Default::default()
-                };
-
-                if let Some(ref since_str) = cli.since {
-                    if let Ok(since_time) = DateTime::parse_from_rfc3339(since_str) {
-                        log_params.since_time = Some(since_time.with_timezone(&Utc));
-                    }
-                }
-
-                match pods.logs(&pod_name, &log_params).await {
-                    Ok(logs) => {
-                        let lines: Vec<String> = logs.lines().map(|s| s.to_string()).collect();
-                        if !cli.json {
-                            println!("  Fetched {} lines", lines.len());
-                        }
-
-                        // Add lines with metadata
-                        for line in lines {
-                            let metadata = LogMetadata {
-                                namespace: namespace.clone(),
-                                pod: pod_name.clone(),
-                                container: container_name.clone(),
-                            };
-                            all_log_lines.push((line, metadata));
-                        }
-                    }
-                    Err(e) => {
-                        if !cli.json {
-                            eprintln!("Error fetching logs for pod {}: {}", pod_name, e);
-                        }
-                    }
+                    eprintln!("Task error: {}", e);
                 }
             }
         }

@@ -134,6 +134,9 @@ The compiled binary will be available at `target/release/leaf`.
 
 # Combine filters for focused analysis
 ./leaf --namespace production --filter error,timeout --threshold 0.8
+
+# Control concurrent log fetching for better resource management
+./leaf --fetch-limit 5
 ```
 
 ### Command Line Options
@@ -147,6 +150,7 @@ The compiled binary will be available at `target/release/leaf`.
 | `--since` | `-s` | Filter logs since RFC3339 timestamp | None |
 | `--filter` | `-f` | Filter logs containing specific strings (comma-separated, case-insensitive) | None |
 | `--member-limit` | `-m` | Limit number of log members in JSON output (0 = unlimited) | 0 |
+| `--fetch-limit` | | Maximum number of concurrent pod log fetches | 10 |
 
 ### Examples
 
@@ -165,6 +169,9 @@ The compiled binary will be available at `target/release/leaf`.
 
 # High-sensitivity clustering for debugging specific issues
 ./leaf -n staging --filter timeout,connection --threshold 0.9
+
+# Reduce concurrent fetches for resource-constrained environments
+./leaf --fetch-limit 3
 ```
 
 ## Output Format
