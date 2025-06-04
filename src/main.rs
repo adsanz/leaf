@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use textdistance::str::sorensen_dice;
-use tokio::sync::mpsc;
 use tokio::task;
 
 #[derive(Parser)]
@@ -807,66 +807,74 @@ async fn cluster_logs_parallel(
         None
     };
 
-    // Create channels for work distribution
-    let (work_tx, work_rx) = mpsc::unbounded_channel::<Vec<WorkItem>>();
-    let work_rx = Arc::new(Mutex::new(work_rx));
-
-    // Send all batches to the work queue
-    for batch in batches {
-        let _ = work_tx.send(batch);
-    }
-    drop(work_tx); // Close the channel
+    // Use a shared work queue with atomic counter for work-stealing
+    let work_queue = Arc::new(Mutex::new(batches));
+    let next_batch_index = Arc::new(AtomicUsize::new(0));
+    let total_batches = work_queue.lock().unwrap().len();
 
     // Spawn worker tasks
     let mut worker_handles = Vec::new();
     for worker_id in 0..num_workers {
-        let work_rx = Arc::clone(&work_rx);
+        let work_queue = Arc::clone(&work_queue);
+        let next_batch_index = Arc::clone(&next_batch_index);
         let string_pool = Arc::clone(&string_pool);
         let progress_bar = batch_progress.clone();
 
         let handle = task::spawn(async move {
             let mut normalizer = LogNormalizer::new();
-            let mut worker_clusters: Vec<OptimizedLogCluster> = Vec::new(); // Use OptimizedLogCluster with string pool
+            let mut worker_clusters: Vec<OptimizedLogCluster> = Vec::new();
             let mut batches_processed = 0;
 
-            while let Some(batch) = {
-                // Try to get work with proper guard scoping
-                {
-                    let mut rx_guard = work_rx.lock().unwrap();
-                    rx_guard.try_recv().ok()
-                }
-            } {
-                batches_processed += 1;
-                if !json_mode && worker_id == 0 {
-                    // Only log from worker 0 to reduce noise
-                    println!(
-                        "Worker {} processing batch {} of {} items",
-                        worker_id,
-                        batches_processed,
-                        batch.len()
-                    );
+            loop {
+                // Atomically get the next batch index
+                let batch_idx = next_batch_index.fetch_add(1, Ordering::SeqCst);
+                
+                if batch_idx >= total_batches {
+                    break; // No more work
                 }
 
-                // Process the batch using memory-mapped clustering
-                for work_item in batch {
-                    process_log_item(
-                        work_item,
-                        &mut worker_clusters,
-                        &mut normalizer,
-                        similarity_threshold,
-                        &string_pool,
-                    )
-                    .await;
-                }
+                // Get the batch
+                let batch = {
+                    let queue = work_queue.lock().unwrap();
+                    if batch_idx < queue.len() {
+                        Some(queue[batch_idx].clone())
+                    } else {
+                        None
+                    }
+                };
 
-                // Update progress bar
-                if let Some(ref pb_mutex) = progress_bar {
-                    let pb = pb_mutex.lock().unwrap();
-                    pb.inc(1);
+                if let Some(batch) = batch {
+                    batches_processed += 1;
+                    if !json_mode {
+                        println!(
+                            "Worker {} processing batch {} of {} items",
+                            worker_id,
+                            batch_idx + 1,
+                            batch.len()
+                        );
+                    }
+
+                    // Process the batch using memory-mapped clustering
+                    for work_item in batch {
+                        process_log_item(
+                            work_item,
+                            &mut worker_clusters,
+                            &mut normalizer,
+                            similarity_threshold,
+                            &string_pool,
+                        )
+                        .await;
+                    }
+
+                    // Update progress bar
+                    if let Some(ref pb_mutex) = progress_bar {
+                        let pb = pb_mutex.lock().unwrap();
+                        pb.inc(1);
+                    }
                 }
             }
 
-            if !json_mode && worker_id == 0 {
+            if !json_mode {
                 println!(
                     "Worker {} completed: {} batches processed, {} clusters created",
                     worker_id,
