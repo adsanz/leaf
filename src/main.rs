@@ -1,13 +1,17 @@
-// Kubernetes log clustering with jaccard similarity
+// Kubernetes log clustering with sorensen_dice similarity
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use futures::stream::{self, StreamExt};
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{ListParams, LogParams};
 use kube::{Api, Client};
+use memmap2::{MmapMut, MmapOptions};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use textdistance::str::jaccard;
+use std::collections::{HashMap, HashSet};
+use std::io::{Seek, SeekFrom};
+use std::sync::{Arc, Mutex};
+use textdistance::str::sorensen_dice;
+use tokio::sync::mpsc;
 use tokio::task;
 
 #[derive(Parser)]
@@ -21,7 +25,7 @@ struct Cli {
     label: Option<String>,
     #[clap(short, long)]
     namespace: Option<String>,
-    #[clap(short = 't', long, default_value = "0.75")]
+    #[clap(short = 't', long, default_value = "0.9")]
     threshold: f64,
     #[clap(short, long)]
     json: bool,
@@ -47,6 +51,263 @@ struct Cli {
         default_value = "10"
     )]
     fetch_limit: usize,
+}
+
+// Memory-mapped string pool for efficient string storage
+#[derive(Debug)]
+struct MmapStringPool {
+    #[allow(dead_code)] // Keeps the file alive for the memory mapping
+    file: std::fs::File,
+    mmap: Option<MmapMut>,
+    string_to_id: HashMap<String, usize>,
+    id_to_offset: Vec<(usize, usize)>, // (offset, length) pairs
+    current_offset: usize,
+    capacity: usize,
+}
+
+impl MmapStringPool {
+    fn new(capacity_mb: usize) -> std::io::Result<Self> {
+        let capacity = capacity_mb * 1024 * 1024; // Convert MB to bytes
+        let temp_file = tempfile::NamedTempFile::new()?;
+        let mut file = temp_file.into_file();
+
+        // Pre-allocate file space
+        file.set_len(capacity as u64)?;
+        file.seek(SeekFrom::Start(0))?;
+
+        let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
+
+        Ok(MmapStringPool {
+            file,
+            mmap: Some(mmap),
+            string_to_id: HashMap::new(),
+            id_to_offset: Vec::new(),
+            current_offset: 0,
+            capacity,
+        })
+    }
+
+    fn intern_string(&mut self, s: &str) -> usize {
+        if let Some(&id) = self.string_to_id.get(s) {
+            return id;
+        }
+
+        let string_bytes = s.as_bytes();
+        let needed_space = string_bytes.len() + 4; // 4 bytes for length prefix
+
+        if self.current_offset + needed_space > self.capacity {
+            // Pool is full, return a fallback ID
+            return usize::MAX;
+        }
+
+        if let Some(ref mut mmap) = self.mmap {
+            // Write length prefix (little-endian u32)
+            let len_bytes = (string_bytes.len() as u32).to_le_bytes();
+            mmap[self.current_offset..self.current_offset + 4].copy_from_slice(&len_bytes);
+
+            // Write string data
+            let string_start = self.current_offset + 4;
+            mmap[string_start..string_start + string_bytes.len()].copy_from_slice(string_bytes);
+
+            let id = self.id_to_offset.len();
+            self.id_to_offset.push((self.current_offset, needed_space));
+            self.string_to_id.insert(s.to_string(), id);
+            self.current_offset += needed_space;
+
+            id
+        } else {
+            usize::MAX
+        }
+    }
+
+    fn get_string(&self, id: usize) -> Option<String> {
+        if id == usize::MAX || id >= self.id_to_offset.len() {
+            return None;
+        }
+
+        let (offset, _size) = self.id_to_offset[id];
+        if let Some(ref mmap) = self.mmap {
+            // Read length prefix
+            let len_bytes = &mmap[offset..offset + 4];
+            let string_len =
+                u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]])
+                    as usize;
+
+            // Read string data
+            let string_start = offset + 4;
+            if string_start + string_len <= mmap.len() {
+                let string_bytes = &mmap[string_start..string_start + string_len];
+                return String::from_utf8(string_bytes.to_vec()).ok();
+            }
+        }
+        None
+    }
+}
+
+// Thread-safe string pool wrapper
+type SharedStringPool = Arc<Mutex<MmapStringPool>>;
+
+// Optimized LogCluster using string pool IDs
+#[derive(Debug, Clone)]
+struct OptimizedLogCluster {
+    representative_id: usize,
+    normalized_text_id: usize,
+    word_ids: Vec<usize>,
+    member_ids: Vec<usize>,
+    member_ids_set: HashSet<usize>, // O(1) deduplication lookup
+    count: usize,
+    sources: Vec<PackedLogMetadata>,
+    sources_set: HashSet<(usize, usize, usize)>, // O(1) source deduplication lookup
+}
+
+// Packed metadata for memory efficiency
+#[derive(Debug, Clone)]
+struct PackedLogMetadata {
+    namespace_id: usize,
+    pod_id: usize,
+    container_id: usize,
+}
+
+impl OptimizedLogCluster {
+    fn new(
+        log_line: &str,
+        words: Vec<String>,
+        normalized_text: String,
+        metadata: LogMetadata,
+        string_pool: &mut MmapStringPool,
+    ) -> Self {
+        let representative_id = string_pool.intern_string(log_line);
+        let normalized_text_id = string_pool.intern_string(&normalized_text);
+        let word_ids: Vec<usize> = words.iter().map(|w| string_pool.intern_string(w)).collect();
+        let member_ids = vec![representative_id];
+        let mut member_ids_set = HashSet::new();
+        member_ids_set.insert(representative_id);
+
+        let packed_metadata = PackedLogMetadata {
+            namespace_id: string_pool.intern_string(&metadata.namespace),
+            pod_id: string_pool.intern_string(&metadata.pod),
+            container_id: string_pool.intern_string(&metadata.container),
+        };
+
+        let mut sources_set = HashSet::new();
+        sources_set.insert((
+            packed_metadata.namespace_id,
+            packed_metadata.pod_id,
+            packed_metadata.container_id,
+        ));
+
+        OptimizedLogCluster {
+            representative_id,
+            normalized_text_id,
+            word_ids,
+            member_ids,
+            member_ids_set,
+            count: 1,
+            sources: vec![packed_metadata],
+            sources_set,
+        }
+    }
+
+    fn add_member(
+        &mut self,
+        log_line: &str,
+        metadata: LogMetadata,
+        string_pool: &mut MmapStringPool,
+    ) {
+        let log_id = string_pool.intern_string(log_line);
+
+        // Only add if not already present (O(1) lookup)
+        if !self.member_ids_set.contains(&log_id) {
+            self.member_ids.push(log_id);
+            self.member_ids_set.insert(log_id);
+            self.count += 1;
+        }
+
+        let packed_metadata = PackedLogMetadata {
+            namespace_id: string_pool.intern_string(&metadata.namespace),
+            pod_id: string_pool.intern_string(&metadata.pod),
+            container_id: string_pool.intern_string(&metadata.container),
+        };
+
+        let source_key = (
+            packed_metadata.namespace_id,
+            packed_metadata.pod_id,
+            packed_metadata.container_id,
+        );
+
+        // Add source metadata if not already present (O(1) lookup)
+        if !self.sources_set.contains(&source_key) {
+            self.sources.push(packed_metadata);
+            self.sources_set.insert(source_key);
+        }
+    }
+
+    fn similarity_to(&self, normalized_text: &str, string_pool: &MmapStringPool) -> f64 {
+        if let Some(stored_text) = string_pool.get_string(self.normalized_text_id) {
+            sorensen_dice_similarity(&stored_text, normalized_text)
+        } else {
+            0.0
+        }
+    }
+
+    fn to_log_cluster(&self, string_pool: &MmapStringPool) -> LogCluster {
+        let representative = string_pool
+            .get_string(self.representative_id)
+            .unwrap_or_default();
+        let normalized_text = string_pool
+            .get_string(self.normalized_text_id)
+            .unwrap_or_default();
+        let words: Vec<String> = self
+            .word_ids
+            .iter()
+            .filter_map(|&id| string_pool.get_string(id))
+            .collect();
+        let members: Vec<String> = self
+            .member_ids
+            .iter()
+            .filter_map(|&id| string_pool.get_string(id))
+            .collect();
+
+        let sources: Vec<LogMetadata> = self
+            .sources
+            .iter()
+            .filter_map(|packed| {
+                let namespace = string_pool.get_string(packed.namespace_id)?;
+                let pod = string_pool.get_string(packed.pod_id)?;
+                let container = string_pool.get_string(packed.container_id)?;
+                Some(LogMetadata {
+                    namespace,
+                    pod,
+                    container,
+                })
+            })
+            .collect();
+
+        // Build HashSets for performance
+        let members_set: HashSet<String> = members.iter().cloned().collect();
+        let sources_set: HashSet<(String, String, String)> = sources
+            .iter()
+            .map(|s| (s.namespace.clone(), s.pod.clone(), s.container.clone()))
+            .collect();
+
+        LogCluster {
+            representative,
+            normalized_text,
+            words,
+            members,
+            members_set,
+            count: self.count,
+            sources,
+            sources_set,
+        }
+    }
+}
+
+// Work item for parallel processing
+#[derive(Debug, Clone)]
+struct WorkItem {
+    log_line: String,
+    metadata: LogMetadata,
 }
 
 // Ultra-fast log normalizer using word extraction and string normalization
@@ -111,13 +372,13 @@ impl LogNormalizer {
     }
 }
 
-// jaccard-based similarity calculation
-fn jaccard_similarity(text1: &str, text2: &str) -> f64 {
+// sorensen_dice-based similarity calculation
+fn sorensen_dice_similarity(text1: &str, text2: &str) -> f64 {
     if text1.is_empty() && text2.is_empty() {
         return 1.0;
     }
 
-    jaccard(text1, text2)
+    sorensen_dice(text1, text2)
 }
 
 // Metadata for tracking log source
@@ -128,47 +389,70 @@ struct LogMetadata {
     container: String,
 }
 
-// Simplified LogCluster with jaccard-based clustering
+// Simplified LogCluster with sorensen_dice-based clustering
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LogCluster {
     representative: String,
     normalized_text: String,
     words: Vec<String>,
     members: Vec<String>,
+    #[serde(skip)] // Skip serialization for performance sets
+    members_set: HashSet<String>, // O(1) deduplication lookup
     count: usize,
     sources: Vec<LogMetadata>,
+    #[serde(skip)] // Skip serialization for performance sets
+    sources_set: HashSet<(String, String, String)>, // O(1) source deduplication lookup
 }
 
 impl LogCluster {
     fn new(log_line: String, normalizer: &mut LogNormalizer, metadata: LogMetadata) -> Self {
         let (words, normalized_text) = normalizer.extract_words_and_normalized(&log_line);
 
+        let mut members_set = HashSet::new();
+        members_set.insert(log_line.clone());
+
+        let mut sources_set = HashSet::new();
+        sources_set.insert((
+            metadata.namespace.clone(),
+            metadata.pod.clone(),
+            metadata.container.clone(),
+        ));
+
         LogCluster {
             representative: log_line.clone(),
             normalized_text,
             words,
             members: vec![log_line],
+            members_set,
             count: 1,
             sources: vec![metadata],
+            sources_set,
         }
     }
 
     fn add_member(&mut self, log_line: String, metadata: LogMetadata) {
-        self.members.push(log_line);
-        self.count += 1;
+        // Only add if not already present (O(1) lookup)
+        if !self.members_set.contains(&log_line) {
+            self.members.push(log_line.clone());
+            self.members_set.insert(log_line);
+            self.count += 1;
+        }
 
-        // Add source metadata if not already present
-        if !self.sources.iter().any(|s| {
-            s.namespace == metadata.namespace
-                && s.pod == metadata.pod
-                && s.container == metadata.container
-        }) {
+        let source_key = (
+            metadata.namespace.clone(),
+            metadata.pod.clone(),
+            metadata.container.clone(),
+        );
+
+        // Add source metadata if not already present (O(1) lookup)
+        if !self.sources_set.contains(&source_key) {
             self.sources.push(metadata);
+            self.sources_set.insert(source_key);
         }
     }
 
     fn similarity_to(&self, normalized_text: &str) -> f64 {
-        jaccard_similarity(&self.normalized_text, normalized_text)
+        sorensen_dice_similarity(&self.normalized_text, normalized_text)
     }
 }
 
@@ -197,7 +481,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut all_log_lines = Vec::new();
-    let mut normalizer = LogNormalizer::new();
 
     // Create tasks for concurrent log fetching
     let mut tasks = Vec::new();
@@ -340,7 +623,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         all_log_lines
     };
 
-    let clusters = cluster_logs(filtered_logs, cli.threshold, &mut normalizer, cli.json);
+    let clusters = cluster_logs_parallel(filtered_logs, cli.threshold, cli.json).await;
 
     if cli.json {
         // Apply member limit if specified for JSON output
@@ -381,7 +664,300 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Ultra-fast clustering using jaccard similarity
+// Parallel clustering using work-stealing with memory-mapped storage
+async fn cluster_logs_parallel(
+    logs: Vec<(String, LogMetadata)>,
+    similarity_threshold: f64,
+    json_mode: bool,
+) -> Vec<LogCluster> {
+    if logs.is_empty() {
+        return Vec::new();
+    }
+
+    if !json_mode {
+        println!(
+            "Starting parallel memory-mapped clustering with {} log lines...",
+            logs.len()
+        );
+    }
+
+    // Create memory-mapped string pool (256MB initial capacity)
+    let string_pool = match MmapStringPool::new(256) {
+        Ok(pool) => Arc::new(Mutex::new(pool)),
+        Err(e) => {
+            if !json_mode {
+                eprintln!(
+                    "Failed to create memory-mapped pool, falling back to regular clustering: {}",
+                    e
+                );
+            }
+            return cluster_logs_fallback(logs, similarity_threshold, json_mode);
+        }
+    };
+
+    // Batch size for work-stealing
+    const BATCH_SIZE: usize = 1000;
+    const NUM_WORKERS: usize = 4; // Use 4 workers for parallelism
+
+    let batches: Vec<Vec<WorkItem>> = logs
+        .into_iter()
+        .map(|(log_line, metadata)| WorkItem { log_line, metadata })
+        .collect::<Vec<_>>()
+        .chunks(BATCH_SIZE)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+
+    if !json_mode {
+        println!(
+            "Split into {} batches with {} workers",
+            batches.len(),
+            NUM_WORKERS
+        );
+    }
+
+    // Create channels for work distribution
+    let (work_tx, work_rx) = mpsc::unbounded_channel::<Vec<WorkItem>>();
+    let work_rx = Arc::new(Mutex::new(work_rx));
+
+    // Send all batches to the work queue
+    for batch in batches {
+        let _ = work_tx.send(batch);
+    }
+    drop(work_tx); // Close the channel
+
+    // Spawn worker tasks
+    let mut worker_handles = Vec::new();
+    for worker_id in 0..NUM_WORKERS {
+        let work_rx = Arc::clone(&work_rx);
+        let string_pool = Arc::clone(&string_pool);
+
+        let handle = task::spawn(async move {
+            let mut normalizer = LogNormalizer::new();
+            let mut worker_clusters: Vec<OptimizedLogCluster> = Vec::new();
+
+            loop {
+                // Try to get work from the shared queue
+                let batch = {
+                    let mut rx_guard = work_rx.lock().unwrap();
+                    match rx_guard.try_recv() {
+                        Ok(batch) => batch,
+                        Err(_) => break, // No more work
+                    }
+                };
+
+                if !json_mode {
+                    println!(
+                        "Worker {} processing batch of {} items",
+                        worker_id,
+                        batch.len()
+                    );
+                }
+
+                for work_item in batch {
+                    process_log_item(
+                        work_item,
+                        &mut worker_clusters,
+                        &mut normalizer,
+                        similarity_threshold,
+                        &string_pool,
+                    )
+                    .await;
+                }
+            }
+
+            worker_clusters
+        });
+
+        worker_handles.push(handle);
+    }
+
+    // Collect results from all workers
+    let mut all_clusters: Vec<OptimizedLogCluster> = Vec::new();
+    for handle in worker_handles {
+        if let Ok(worker_clusters) = handle.await {
+            all_clusters.extend(worker_clusters);
+        }
+    }
+
+    if !json_mode {
+        println!("Collected {} clusters from all workers", all_clusters.len());
+    }
+
+    // Merge similar clusters across workers (simplified approach)
+    let merged_clusters = merge_clusters(all_clusters, similarity_threshold, &string_pool).await;
+
+    if !json_mode {
+        println!(
+            "Merging complete, final clusters: {}",
+            merged_clusters.len()
+        );
+    }
+
+    // Convert optimized clusters back to regular clusters
+    let string_pool_guard = string_pool.lock().unwrap();
+    let result_clusters: Vec<LogCluster> = merged_clusters
+        .iter()
+        .map(|opt_cluster| opt_cluster.to_log_cluster(&*string_pool_guard))
+        .collect();
+    drop(string_pool_guard);
+
+    // Sort by count, descending
+    let mut sorted_clusters = result_clusters;
+    sorted_clusters.sort_by(|a, b| b.count.cmp(&a.count));
+
+    if !json_mode {
+        println!(
+            "Parallel clustering complete! Created {} clusters",
+            sorted_clusters.len()
+        );
+    }
+
+    sorted_clusters
+}
+
+// Merge clusters from different workers
+async fn merge_clusters(
+    mut clusters: Vec<OptimizedLogCluster>,
+    similarity_threshold: f64,
+    string_pool: &SharedStringPool,
+) -> Vec<OptimizedLogCluster> {
+    if clusters.len() <= 1 {
+        return clusters;
+    }
+
+    // Sort by count to prioritize larger clusters
+    clusters.sort_by(|a, b| b.count.cmp(&a.count));
+
+    let mut merged: Vec<OptimizedLogCluster> = Vec::new();
+
+    for cluster in clusters {
+        let mut found_merge = false;
+        let string_pool_guard = string_pool.lock().unwrap();
+
+        if let Some(cluster_text) = string_pool_guard.get_string(cluster.normalized_text_id) {
+            // Check if this cluster can be merged with any existing one
+            for merged_cluster in &mut merged {
+                if let Some(merged_text) =
+                    string_pool_guard.get_string(merged_cluster.normalized_text_id)
+                {
+                    let similarity = sorensen_dice_similarity(&cluster_text, &merged_text);
+                    if similarity >= similarity_threshold {
+                        // Merge clusters with O(1) deduplication
+
+                        // Deduplicate member_ids using HashSet
+                        for &member_id in &cluster.member_ids {
+                            if !merged_cluster.member_ids_set.contains(&member_id) {
+                                merged_cluster.member_ids.push(member_id);
+                                merged_cluster.member_ids_set.insert(member_id);
+                            }
+                        }
+
+                        // Deduplicate sources using HashSet
+                        for source in &cluster.sources {
+                            let source_key =
+                                (source.namespace_id, source.pod_id, source.container_id);
+                            if !merged_cluster.sources_set.contains(&source_key) {
+                                merged_cluster.sources.push(source.clone());
+                                merged_cluster.sources_set.insert(source_key);
+                            }
+                        }
+
+                        // Recalculate count based on actual unique members
+                        merged_cluster.count = merged_cluster.member_ids.len();
+                        found_merge = true;
+                        break;
+                    }
+                }
+            }
+        }
+        drop(string_pool_guard);
+
+        if !found_merge {
+            merged.push(cluster);
+        }
+    }
+
+    merged
+}
+
+// Process a single log item with the shared string pool
+async fn process_log_item(
+    work_item: WorkItem,
+    clusters: &mut Vec<OptimizedLogCluster>,
+    normalizer: &mut LogNormalizer,
+    similarity_threshold: f64,
+    string_pool: &SharedStringPool,
+) {
+    let log_line = work_item.log_line;
+    let metadata = work_item.metadata;
+
+    if log_line.trim().is_empty() {
+        return;
+    }
+
+    let (words, normalized_text) = normalizer.extract_words_and_normalized(&log_line);
+
+    // Skip lines with no meaningful words
+    if words.is_empty() {
+        return;
+    }
+
+    let mut best_match_index: Option<usize> = None;
+    let mut max_similarity = 0.0;
+
+    // Limit cluster checking for performance
+    let check_limit = if clusters.len() > 50 {
+        50 // More aggressive limiting in parallel mode
+    } else {
+        clusters.len()
+    };
+
+    // Lock the string pool for similarity checks
+    let string_pool_guard = string_pool.lock().unwrap();
+
+    for (i, cluster) in clusters.iter().enumerate().take(check_limit) {
+        let similarity = cluster.similarity_to(&normalized_text, &*string_pool_guard);
+        if similarity > max_similarity {
+            max_similarity = similarity;
+            if similarity >= similarity_threshold {
+                best_match_index = Some(i);
+                break; // Early exit on good match
+            }
+        }
+    }
+    drop(string_pool_guard);
+
+    if let Some(index) = best_match_index {
+        let mut string_pool_guard = string_pool.lock().unwrap();
+        clusters[index].add_member(&log_line, metadata, &mut *string_pool_guard);
+    } else {
+        // Limit total clusters to prevent memory issues
+        if clusters.len() < 100 {
+            // Lower limit per worker
+            let mut string_pool_guard = string_pool.lock().unwrap();
+            let new_cluster = OptimizedLogCluster::new(
+                &log_line,
+                words,
+                normalized_text,
+                metadata,
+                &mut *string_pool_guard,
+            );
+            clusters.push(new_cluster);
+        }
+    }
+}
+
+// Fallback clustering function (original implementation)
+fn cluster_logs_fallback(
+    logs: Vec<(String, LogMetadata)>,
+    similarity_threshold: f64,
+    json_mode: bool,
+) -> Vec<LogCluster> {
+    let mut normalizer = LogNormalizer::new();
+    cluster_logs(logs, similarity_threshold, &mut normalizer, json_mode)
+}
+
+// Ultra-fast clustering using sorensen_dice similarity
 fn cluster_logs(
     logs: Vec<(String, LogMetadata)>,
     similarity_threshold: f64,
@@ -396,7 +972,7 @@ fn cluster_logs(
 
     if !json_mode {
         println!(
-            "Starting fast jaccard-based clustering with {} log lines...",
+            "Starting fast sorensen_dice-based clustering with {} log lines...",
             logs.len()
         );
     }

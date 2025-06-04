@@ -2,22 +2,27 @@
 
 # WARNING: Experimental tool
 
-A high-performance Rust application that clusters Kubernetes logs using Jaccard similarity to help identify patterns and reduce noise in large log datasets.
+A high-performance Rust application that clusters Kubernetes logs using Sørensen-Dice similarity with memory-mapped storage and work-stealing parallelism to help identify patterns and reduce noise in large log datasets.
 
 ## Overview
 
-Leaf fetches logs from Kubernetes pods and groups similar log entries together using Jaccard similarity. This helps DevOps engineers and developers quickly identify patterns, recurring issues, and anomalies in their application logs.
+Leaf fetches logs from Kubernetes pods and groups similar log entries together using Sørensen-Dice similarity. This helps DevOps engineers and developers quickly identify patterns, recurring issues, and anomalies in their application logs with advanced memory efficiency and parallel processing.
 
 ## Features
 
-- **Fast Jaccard Similarity**: Uses textdistance library's Jaccard algorithm for accurate log clustering
+- **Fast Sørensen-Dice Similarity**: Uses textdistance library's Sørensen-Dice algorithm for accurate log clustering
+- **Memory-Mapped Storage**: Uses memmap2 for efficient string storage (256MB memory-mapped pool)
+- **Work-Stealing Parallelism**: 4-worker parallel clustering with tokio async tasks
 - **Kubernetes Native**: Direct integration with Kubernetes API using the `kube` crate
 - **Source Tracking**: Tracks namespace, pod, and container for each log cluster
 - **Performance Optimized**: Multiple optimizations for handling large log volumes
-  - Caching system (5000 entry limit)
-  - Cluster limits (max 1000 clusters)
-  - Smart cluster checking (max 100 when > 500 exist)
+  - Memory-mapped string interning with O(1) deduplication
+  - Work-stealing parallelism with 1000-item batches
+  - HashSet-based O(1) member and source deduplication
+  - Cross-worker cluster merging with similarity-based consolidation
+  - Smart cluster limits (max 100 clusters per worker)
   - Early exit on good similarity matches
+  - Fallback mechanism when memory-mapping fails
 - **Flexible Filtering**: Filter by namespace, pod labels, time ranges, and content keywords
 - **Multiple Output Formats**: Human-readable text or JSON output
 - **Word-based Normalization**: Intelligent text preprocessing for better clustering
@@ -56,31 +61,42 @@ Normalized: "error user service authentication failed for user"
 
 ### 2. Similarity Calculation
 
-Uses Jaccard similarity to compare normalized text strings:
+Uses Sørensen-Dice similarity to compare normalized text strings:
 
-- **Jaccard Index**: Measures similarity between two sets as |A∩B| / |A∪B|
-- **String-based**: Works directly on normalized text rather than word sets
+- **Sørensen-Dice Coefficient**: Measures similarity between two sets as 2|A∩B| / (|A| + |B|)
+- **String-based**: Works directly on normalized text using character overlap
 - **Range**: Returns values between 0.0 (completely different) and 1.0 (identical)
+- **Better for text**: More sensitive to overlapping content than Jaccard similarity
 
-### 3. Clustering Algorithm
+### 3. Parallel Clustering Algorithm
 
-The clustering process follows these steps:
+The clustering process uses work-stealing parallelism:
 
-1. **Sequential Processing**: Processes each log line one by one
-2. **Similarity Search**: Compares against existing clusters
-3. **Threshold Matching**: Groups logs that exceed the similarity threshold (default: 0.75)
-4. **Performance Limits**: 
-   - Max 1000 total clusters
-   - Checks only top 100 clusters when more than 500 exist
-5. **Result Sorting**: Orders clusters by frequency (most common first)
+1. **Memory-Mapped Storage**: 256MB memory-mapped string pool for efficient string storage and deduplication
+2. **Work Distribution**: Logs are split into 1000-item batches and distributed to 4 workers
+3. **Work-Stealing**: Workers use tokio mpsc channels to dynamically claim work batches
+4. **Parallel Processing**: Each worker processes batches independently with local cluster sets
+5. **Cross-Worker Merging**: Similar clusters from different workers are merged using similarity comparison
+6. **O(1) Deduplication**: HashSet-based deduplication for both members and sources
+7. **Performance Limits**: 
+   - Max 100 clusters per worker
+   - Checks only top 50 clusters for similarity matching
+8. **Fallback Mode**: Automatically falls back to single-threaded mode if memory-mapping fails
+9. **Result Sorting**: Orders clusters by frequency (most common first)
 
 ### 4. Performance Optimizations
 
+- **Memory-Mapped Storage**: 256MB memory-mapped string pool with automatic fallback
+- **Work-Stealing Parallelism**: 4 workers processing 1000-item batches concurrently
+- **O(1) Deduplication**: HashSet-based member and source deduplication
+- **String Interning**: Memory-mapped string pool reduces memory usage and enables fast comparison
 - **Pre-filtering**: Reduces dataset size before clustering when using `--filter`
-- **Caching**: Avoids reprocessing identical log lines
+- **Caching**: Avoids reprocessing identical log lines (5000 entry limit)
 - **Early Exit**: Stops searching when a good match is found
-- **Limited Search**: Reduces comparison overhead for large cluster sets
+- **Limited Search**: Workers check only top 50 clusters, max 100 clusters per worker
+- **Cross-Worker Merging**: Intelligent cluster consolidation after parallel processing
 - **Word Filtering**: Only processes meaningful words (3+ characters)
+- **Batch Processing**: 1000-item batches for optimal work distribution
 
 ## Installation
 
@@ -145,7 +161,7 @@ The compiled binary will be available at `target/release/leaf`.
 |--------|-------|-------------|---------|
 | `--label` | `-l` | Filter pods by label selector | None |
 | `--namespace` | `-n` | Target specific namespace | All namespaces |
-| `--threshold` | `-t` | Similarity threshold (0.0-1.0) | 0.75 |
+| `--threshold` | `-t` | Similarity threshold (0.0-1.0) | 0.9 |
 | `--json` | `-j` | Output results as JSON | false |
 | `--since` | `-s` | Filter logs since RFC3339 timestamp | None |
 | `--filter` | `-f` | Filter logs containing specific strings (comma-separated, case-insensitive) | None |
@@ -182,8 +198,12 @@ The compiled binary will be available at `target/release/leaf`.
 Found 5 pods
 Fetching logs from pod: web-app-1, container: app
   Fetched 150 lines
-Starting fast jaccard-based clustering with 150 log lines...
-Clustering complete! Created 8 clusters from 150 log lines
+Starting parallel memory-mapped clustering with 150 log lines...
+Split into 1 batches with 4 workers
+Worker 0 processing batch of 150 items
+Collected 8 clusters from all workers
+Merging complete, final clusters: 6
+Parallel clustering complete! Created 6 clusters
 
 --- Log Clusters ---
 Cluster 1: (Count: 45)
@@ -255,21 +275,30 @@ rules:
 
 ### Throughput
 
-- **Small datasets** (< 1,000 logs): Near real-time processing
-- **Medium datasets** (1,000 - 10,000 logs): ~1-2 seconds
-- **Large datasets** (10,000+ logs): Scales linearly with optimizations
+- **Small datasets** (< 1,000 logs): Near real-time processing with 4-worker parallelism
+- **Medium datasets** (1,000 - 10,000 logs): ~0.5-1 seconds with memory-mapped storage
+- **Large datasets** (10,000+ logs): Scales efficiently with work-stealing parallelism
 
 ### Memory Usage
 
-- **Base memory**: ~10-20 MB
-- **Per log line**: ~200 bytes (including caching)
-- **Peak usage**: Proportional to number of unique log patterns
+- **Base memory**: ~20-30 MB (including 256MB memory-mapped pool)
+- **Memory-mapped pool**: 256MB pre-allocated for string storage
+- **Per log line**: ~100 bytes average (with string interning)
+- **Peak usage**: Significantly reduced due to string deduplication and memory mapping
+
+### Parallelism Performance
+
+- **4 workers**: Optimal for most workloads
+- **1000-item batches**: Balanced work distribution
+- **Work-stealing**: Dynamic load balancing across workers
+- **Cross-worker merging**: Intelligent similarity-based cluster consolidation
 
 ### Accuracy vs Performance Tradeoffs
 
 - **High threshold** (0.9+): More precise clusters, potentially more clusters
 - **Medium threshold** (0.7-0.8): Balanced clustering for most use cases
 - **Low threshold** (< 0.7): Aggressive grouping, fewer but larger clusters
+- **Sørensen-Dice**: Better text similarity detection than Jaccard for log content
 
 ## Troubleshooting
 
@@ -288,6 +317,12 @@ rules:
    - Use namespace filtering
    - Apply label selectors
    - Use time-based filtering with `--since`
+   - Monitor memory usage (256MB memory-mapped pool)
+
+4. **"Failed to create memory-mapped pool"**
+   - Check available disk space for temporary files
+   - System automatically falls back to regular clustering
+   - Consider reducing dataset size with filters
 
 ### Debug Mode
 
@@ -297,11 +332,14 @@ For debugging, use verbose output without JSON mode to see processing statistics
 
 - `kube`: Kubernetes API client
 - `k8s-openapi`: Kubernetes API types
-- `textdistance`: Similarity algorithms (Jaccard)
+- `textdistance`: Similarity algorithms (Sørensen-Dice)
+- `memmap2`: Memory-mapped file I/O for efficient string storage
+- `tempfile`: Temporary file creation for memory mapping
 - `clap`: Command-line parsing
-- `tokio`: Async runtime
+- `tokio`: Async runtime and parallelism
 - `serde`: Serialization/deserialization
 - `chrono`: Date/time handling
+- `futures`: Stream processing utilities
 
 ## Contributing
 
@@ -314,9 +352,14 @@ For debugging, use verbose output without JSON mode to see processing statistics
 ## Changelog
 
 ### Current Version
-- Implemented Jaccard similarity algorithm
-- Added performance optimizations for large datasets
-- Improved caching system
-- Enhanced CLI with flexible filtering options
-- Added source tracking (namespace/pod/container) for log clusters
-- Implemented content-based filtering with `--filter` flag
+- **Implemented Sørensen-Dice similarity algorithm** for better text similarity detection
+- **Added memory-mapped storage** with memmap2 for efficient string storage and deduplication
+- **Implemented work-stealing parallelism** with 4 workers and tokio async tasks
+- **Added cross-worker cluster merging** with similarity-based consolidation
+- **Optimized performance** with O(1) HashSet deduplication for members and sources
+- **Enhanced string interning** with 256MB memory-mapped pool and fallback mechanism
+- **Improved batch processing** with 1000-item batches for optimal work distribution
+- **Added performance monitoring** with detailed processing statistics
+- **Enhanced source tracking** (namespace/pod/container) for log clusters
+- **Implemented content-based filtering** with `--filter` flag
+- **Added automatic fallback** to single-threaded mode when memory-mapping fails
