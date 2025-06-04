@@ -360,9 +360,9 @@ impl LogNormalizer {
         if alpha_count < len.div_ceil(2) {
             return true;
         }
-        // Exclude words with high entropy (many unique characters, not dictionary-like)
+        // Relaxed: Only exclude very high-entropy words (all unique, len >= 12)
         let unique_chars = word.chars().collect::<std::collections::HashSet<_>>().len();
-        if len > 8 && unique_chars as f32 / len as f32 > 0.7 {
+        if len >= 12 && unique_chars as f32 / len as f32 > 0.85 {
             return true;
         }
         false
@@ -387,14 +387,12 @@ impl LogNormalizer {
 
     fn fast_extract_words_and_normalized(&self, log_line: &str) -> (Vec<String>, String) {
         let mut words = Vec::new();
-        let mut normalized_chars = Vec::new();
         let mut current_word = String::new();
 
         for ch in log_line.chars() {
             if ch.is_alphabetic() {
                 let lower_ch = ch.to_ascii_lowercase();
                 current_word.push(lower_ch);
-                normalized_chars.push(lower_ch);
             } else {
                 if !current_word.is_empty()
                     && current_word.len() >= 3
@@ -403,10 +401,6 @@ impl LogNormalizer {
                     words.push(current_word.clone());
                 }
                 current_word.clear();
-                // Add space to normalized string for word separation
-                if !normalized_chars.is_empty() && normalized_chars.last() != Some(&' ') {
-                    normalized_chars.push(' ');
-                }
             }
         }
 
@@ -418,8 +412,9 @@ impl LogNormalizer {
             words.push(current_word);
         }
 
-        let normalized_string: String = normalized_chars.into_iter().collect();
-        (words, normalized_string.trim().to_string())
+        // Normalized string is now just the filtered words joined by space
+        let normalized_string = words.join(" ");
+        (words, normalized_string)
     }
 }
 
