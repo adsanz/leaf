@@ -2,6 +2,7 @@
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use futures::stream::{self, StreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{ListParams, LogParams};
 use kube::{Api, Client};
@@ -563,6 +564,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Create progress bar for log fetching
+    let fetch_progress = if !cli.json {
+        let pb = ProgressBar::new(tasks.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        pb.set_message("Fetching logs from pods...");
+        Some(pb)
+    } else {
+        None
+    };
+
     // Execute tasks with concurrency limit
     let concurrent_stream = stream::iter(tasks).buffer_unordered(cli.fetch_limit);
 
@@ -573,16 +589,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match result {
             Ok(Ok(log_entries)) => {
                 all_log_lines.extend(log_entries);
+                if let Some(ref pb) = fetch_progress {
+                    pb.inc(1);
+                }
             }
             Ok(Err(_)) => {
                 // Error already logged in the task
+                if let Some(ref pb) = fetch_progress {
+                    pb.inc(1);
+                }
             }
             Err(e) => {
                 if !cli.json {
                     eprintln!("Task error: {}", e);
                 }
+                if let Some(ref pb) = fetch_progress {
+                    pb.inc(1);
+                }
             }
         }
+    }
+
+    if let Some(pb) = fetch_progress {
+        pb.finish_with_message("Log fetching complete!");
     }
 
     if !cli.json {
@@ -595,15 +624,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Apply filtering if filter strings are provided
     let filtered_logs = if !cli.filter.is_empty() {
         let original_count = all_log_lines.len();
+        
+        // Create progress bar for filtering
+        let filter_progress = if !cli.json {
+            let pb = ProgressBar::new(original_count as u64);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.yellow/blue}] {pos}/{len} {msg}")
+                    .unwrap()
+                    .progress_chars("#>-"),
+            );
+            pb.set_message("Filtering logs...");
+            Some(pb)
+        } else {
+            None
+        };
+
         let filtered: Vec<(String, LogMetadata)> = all_log_lines
             .into_iter()
-            .filter(|(line, _metadata)| {
+            .enumerate()
+            .filter_map(|(i, (line, metadata))| {
+                if let Some(ref pb) = filter_progress {
+                    if i % 100 == 0 { // Update every 100 items to avoid too frequent updates
+                        pb.set_position(i as u64);
+                    }
+                }
+                
                 let line_lower = line.to_lowercase();
-                cli.filter
+                let matches = cli.filter
                     .iter()
-                    .any(|filter| line_lower.contains(&filter.to_lowercase()))
+                    .any(|filter| line_lower.contains(&filter.to_lowercase()));
+                
+                if matches {
+                    Some((line, metadata))
+                } else {
+                    None
+                }
             })
             .collect();
+
+        if let Some(pb) = filter_progress {
+            pb.finish_with_message("Filtering complete!");
+        }
 
         if !cli.json {
             println!(
@@ -695,25 +757,47 @@ async fn cluster_logs_parallel(
         }
     };
 
-    // Batch size for work-stealing
-    const BATCH_SIZE: usize = 1000;
-    const NUM_WORKERS: usize = 4; // Use 4 workers for parallelism
+    // Optimized batch size and worker count for better parallelism with large datasets
+    let batch_size = if logs.len() > 100_000 { 
+        (logs.len() / 1000).max(500) // Minimum 500, scale with dataset size
+    } else { 
+        1000 
+    };
+    let num_workers = std::thread::available_parallelism()
+        .map(|n| n.get().min(16)) // Cap at 16 workers
+        .unwrap_or(8); // Default to 8 workers if detection fails
 
     let batches: Vec<Vec<WorkItem>> = logs
         .into_iter()
         .map(|(log_line, metadata)| WorkItem { log_line, metadata })
         .collect::<Vec<_>>()
-        .chunks(BATCH_SIZE)
+        .chunks(batch_size)
         .map(|chunk| chunk.to_vec())
         .collect();
 
     if !json_mode {
         println!(
-            "Split into {} batches with {} workers",
+            "Split into {} batches with {} workers (batch size: {})",
             batches.len(),
-            NUM_WORKERS
+            num_workers,
+            batch_size
         );
     }
+
+    // Create progress bar for batch processing
+    let batch_progress = if !json_mode {
+        let pb = ProgressBar::new(batches.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        pb.set_message("Processing batches in parallel...");
+        Some(Arc::new(Mutex::new(pb)))
+    } else {
+        None
+    };
 
     // Create channels for work distribution
     let (work_tx, work_rx) = mpsc::unbounded_channel::<Vec<WorkItem>>();
@@ -727,32 +811,48 @@ async fn cluster_logs_parallel(
 
     // Spawn worker tasks
     let mut worker_handles = Vec::new();
-    for worker_id in 0..NUM_WORKERS {
+    for worker_id in 0..num_workers {
         let work_rx = Arc::clone(&work_rx);
         let string_pool = Arc::clone(&string_pool);
+        let progress_bar = batch_progress.clone();
 
         let handle = task::spawn(async move {
             let mut normalizer = LogNormalizer::new();
-            let mut worker_clusters: Vec<OptimizedLogCluster> = Vec::new();
+            let mut worker_clusters: Vec<OptimizedLogCluster> = Vec::new(); // Use OptimizedLogCluster with string pool
+            let mut batches_processed = 0;
 
-            loop {
-                // Try to get work from the shared queue
-                let batch = {
+            while let Some(batch) = {
+                // Try to get work with proper guard scoping
+                let batch_option = {
                     let mut rx_guard = work_rx.lock().unwrap();
                     match rx_guard.try_recv() {
-                        Ok(batch) => batch,
-                        Err(_) => break, // No more work
+                        Ok(batch) => Some(batch),
+                        Err(mpsc::error::TryRecvError::Empty) => None,
+                        Err(mpsc::error::TryRecvError::Disconnected) => None,
                     }
-                };
-
-                if !json_mode {
+                }; // Guard is dropped here
+                
+                match batch_option {
+                    Some(batch) => Some(batch),
+                    None => {
+                        // No work available, yield to other tasks and add small delay
+                        tokio::task::yield_now().await;
+                        tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
+                        None
+                    }
+                }
+            } {
+                batches_processed += 1;
+                if !json_mode && worker_id == 0 { // Only log from worker 0 to reduce noise
                     println!(
-                        "Worker {} processing batch of {} items",
+                        "Worker {} processing batch {} of {} items",
                         worker_id,
+                        batches_processed,
                         batch.len()
                     );
                 }
 
+                // Process the batch using memory-mapped clustering
                 for work_item in batch {
                     process_log_item(
                         work_item,
@@ -760,9 +860,23 @@ async fn cluster_logs_parallel(
                         &mut normalizer,
                         similarity_threshold,
                         &string_pool,
-                    )
-                    .await;
+                    ).await;
                 }
+
+                // Update progress bar
+                if let Some(ref pb_mutex) = progress_bar {
+                    let pb = pb_mutex.lock().unwrap();
+                    pb.inc(1);
+                }
+            }
+
+            if !json_mode && worker_id == 0 {
+                println!(
+                    "Worker {} completed: {} batches processed, {} clusters created",
+                    worker_id,
+                    batches_processed,
+                    worker_clusters.len()
+                );
             }
 
             worker_clusters
@@ -779,12 +893,37 @@ async fn cluster_logs_parallel(
         }
     }
 
+    // Finish batch processing progress bar
+    if let Some(pb_mutex) = batch_progress {
+        let pb = pb_mutex.lock().unwrap();
+        pb.finish_with_message("Batch processing complete!");
+    }
+
     if !json_mode {
         println!("Collected {} clusters from all workers", all_clusters.len());
     }
 
-    // Merge similar clusters across workers (simplified approach)
-    let merged_clusters = merge_clusters(all_clusters, similarity_threshold, &string_pool).await;
+    // Create progress bar for cluster merging
+    let merge_progress = if !json_mode && all_clusters.len() > 1 {
+        let pb = ProgressBar::new(all_clusters.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.magenta/blue}] {pos}/{len} {msg}")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        pb.set_message("Merging clusters across workers...");
+        Some(pb)
+    } else {
+        None
+    };
+
+    // Merge similar clusters across workers using the original merge function
+    let merged_clusters = merge_clusters(all_clusters, similarity_threshold, &string_pool, merge_progress.as_ref()).await;
+
+    if let Some(pb) = merge_progress {
+        pb.finish_with_message("Cluster merging complete!");
+    }
 
     if !json_mode {
         println!(
@@ -815,11 +954,14 @@ async fn cluster_logs_parallel(
     sorted_clusters
 }
 
+
+
 // Merge clusters from different workers
 async fn merge_clusters(
     mut clusters: Vec<OptimizedLogCluster>,
     similarity_threshold: f64,
     string_pool: &SharedStringPool,
+    progress_bar: Option<&ProgressBar>,
 ) -> Vec<OptimizedLogCluster> {
     if clusters.len() <= 1 {
         return clusters;
@@ -830,7 +972,7 @@ async fn merge_clusters(
 
     let mut merged: Vec<OptimizedLogCluster> = Vec::new();
 
-    for cluster in clusters {
+    for (i, cluster) in clusters.into_iter().enumerate() {
         let mut found_merge = false;
         let string_pool_guard = string_pool.lock().unwrap();
 
@@ -874,6 +1016,11 @@ async fn merge_clusters(
 
         if !found_merge {
             merged.push(cluster);
+        }
+
+        // Update progress bar
+        if let Some(pb) = progress_bar {
+            pb.set_position((i + 1) as u64);
         }
     }
 
@@ -947,6 +1094,8 @@ async fn process_log_item(
     }
 }
 
+
+
 // Fallback clustering function (original implementation)
 fn cluster_logs_fallback(
     logs: Vec<(String, LogMetadata)>,
@@ -977,6 +1126,21 @@ fn cluster_logs(
         );
     }
 
+    // Create progress bar for fallback clustering
+    let clustering_progress = if !json_mode {
+        let pb = ProgressBar::new(logs.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        pb.set_message("Clustering logs (fallback mode)...");
+        Some(pb)
+    } else {
+        None
+    };
+
     let mut processed = 0;
 
     for (log_line, metadata) in logs {
@@ -991,6 +1155,13 @@ fn cluster_logs(
                 processed,
                 clusters.len()
             );
+        }
+
+        // Update progress bar
+        if let Some(ref pb) = clustering_progress {
+            if processed % 10 == 0 { // Update every 10 items to avoid too frequent updates
+                pb.set_position(processed as u64);
+            }
         }
 
         let (words, normalized_text) = normalizer.extract_words_and_normalized(&log_line);
@@ -1029,6 +1200,11 @@ fn cluster_logs(
                 clusters.push(LogCluster::new(log_line, normalizer, metadata));
             }
         }
+    }
+
+    // Finish clustering progress bar
+    if let Some(pb) = clustering_progress {
+        pb.finish_with_message("Clustering complete!");
     }
 
     // Sort by count, descending
