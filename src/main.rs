@@ -1,6 +1,7 @@
 // Kubernetes log clustering with sorensen_dice similarity
 use chrono::{DateTime, Utc};
 use clap::Parser;
+use crossbeam_deque::{Injector, Worker};
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use k8s_openapi::api::core::v1::Pod;
@@ -10,8 +11,8 @@ use memmap2::{MmapMut, MmapOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{Seek, SeekFrom};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use textdistance::str::sorensen_dice;
 use tokio::task;
 
@@ -807,18 +808,55 @@ async fn cluster_logs_parallel(
         None
     };
 
-    // Use a shared work queue with atomic counter for work-stealing
-    let work_queue = Arc::new(Mutex::new(batches));
-    let next_batch_index = Arc::new(AtomicUsize::new(0));
-    let total_batches = work_queue.lock().unwrap().len();
+    // Create atomic counter for real-time progress tracking
+    let completed_batches = Arc::new(AtomicUsize::new(0));
+
+    // Start background progress updater for real-time updates
+    let progress_updater_handle = if let Some(ref progress_bar) = batch_progress {
+        let pb = Arc::clone(progress_bar);
+        let counter = Arc::clone(&completed_batches);
+        let total_batches = batches.len();
+
+        Some(task::spawn(async move {
+            let mut last_count = 0;
+            while last_count < total_batches {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                let current_count = counter.load(Ordering::Relaxed);
+                if current_count > last_count {
+                    let pb = pb.lock().unwrap();
+                    pb.set_position(current_count as u64);
+                    last_count = current_count;
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Create lock-free work-stealing queue
+    let global_queue = Arc::new(Injector::new());
+    let mut stealers = Vec::new();
+
+    // Create workers and populate global queue
+    let mut workers = Vec::new();
+    for _ in 0..num_workers {
+        let worker = Worker::new_fifo();
+        stealers.push(worker.stealer());
+        workers.push(worker);
+    }
+
+    // Push all batches to the global queue
+    for batch in batches {
+        global_queue.push(batch);
+    }
 
     // Spawn worker tasks
     let mut worker_handles = Vec::new();
-    for worker_id in 0..num_workers {
-        let work_queue = Arc::clone(&work_queue);
-        let next_batch_index = Arc::clone(&next_batch_index);
+    for (worker_id, worker) in workers.into_iter().enumerate() {
+        let global_queue = Arc::clone(&global_queue);
+        let stealers = stealers.clone();
         let string_pool = Arc::clone(&string_pool);
-        let progress_bar = batch_progress.clone();
+        let progress_counter = Arc::clone(&completed_batches);
 
         let handle = task::spawn(async move {
             let mut normalizer = LogNormalizer::new();
@@ -826,52 +864,57 @@ async fn cluster_logs_parallel(
             let mut batches_processed = 0;
 
             loop {
-                // Atomically get the next batch index
-                let batch_idx = next_batch_index.fetch_add(1, Ordering::SeqCst);
-                
-                if batch_idx >= total_batches {
-                    break; // No more work
-                }
+                // Try to get work from own queue first, then steal from global or other workers
+                let batch = worker
+                    .pop()
+                    .or_else(|| {
+                        // If own queue is empty, try to steal from global queue
+                        global_queue.steal().success()
+                    })
+                    .or_else(|| {
+                        // If global queue is empty, try to steal from other workers
+                        stealers
+                            .iter()
+                            .map(|s| s.steal())
+                            .find_map(|steal_result| steal_result.success())
+                    });
 
-                // Get the batch
-                let batch = {
-                    let queue = work_queue.lock().unwrap();
-                    if batch_idx < queue.len() {
-                        Some(queue[batch_idx].clone())
-                    } else {
-                        None
+                let batch = match batch {
+                    Some(batch) => batch,
+                    None => {
+                        // No more work available, check once more and exit
+                        if global_queue.is_empty() && worker.is_empty() {
+                            break;
+                        }
+                        // Brief yield to avoid busy waiting
+                        tokio::task::yield_now().await;
+                        continue;
                     }
                 };
 
-                if let Some(batch) = batch {
-                    batches_processed += 1;
-                    if !json_mode {
-                        println!(
-                            "Worker {} processing batch {} of {} items",
-                            worker_id,
-                            batch_idx + 1,
-                            batch.len()
-                        );
-                    }
-
-                    // Process the batch using memory-mapped clustering
-                    for work_item in batch {
-                        process_log_item(
-                            work_item,
-                            &mut worker_clusters,
-                            &mut normalizer,
-                            similarity_threshold,
-                            &string_pool,
-                        )
-                        .await;
-                    }
-
-                    // Update progress bar
-                    if let Some(ref pb_mutex) = progress_bar {
-                        let pb = pb_mutex.lock().unwrap();
-                        pb.inc(1);
-                    }
+                batches_processed += 1;
+                if !json_mode {
+                    println!(
+                        "Worker {} processing batch of {} items",
+                        worker_id,
+                        batch.len()
+                    );
                 }
+
+                // Process the batch using memory-mapped clustering
+                for work_item in batch {
+                    process_log_item(
+                        work_item,
+                        &mut worker_clusters,
+                        &mut normalizer,
+                        similarity_threshold,
+                        &string_pool,
+                    )
+                    .await;
+                }
+
+                // Update progress counter (background updater will handle progress bar)
+                progress_counter.fetch_add(1, Ordering::Relaxed);
             }
 
             if !json_mode {
@@ -895,6 +938,11 @@ async fn cluster_logs_parallel(
         if let Ok(worker_clusters) = handle.await {
             all_clusters.extend(worker_clusters);
         }
+    }
+
+    // Stop the progress updater
+    if let Some(updater) = progress_updater_handle {
+        let _ = updater.await;
     }
 
     // Finish batch processing progress bar
