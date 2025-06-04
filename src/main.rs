@@ -13,8 +13,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{Seek, SeekFrom};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use textdistance::str::sorensen_dice;
 use tokio::task;
+use std::time::Instant;
 
 #[derive(Parser)]
 #[clap(
@@ -65,6 +67,8 @@ struct MmapStringPool {
     id_to_offset: Vec<(usize, usize)>, // (offset, length) pairs
     current_offset: usize,
     capacity: usize,
+    #[allow(dead_code)]
+    lock_count: Arc<AtomicUsize>, // For lock contention measurement
 }
 
 impl MmapStringPool {
@@ -86,6 +90,7 @@ impl MmapStringPool {
             id_to_offset: Vec::new(),
             current_offset: 0,
             capacity,
+            lock_count: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -765,6 +770,8 @@ async fn cluster_logs_parallel(
         }
     };
 
+    let start = Instant::now();
+
     // Optimized batch size and worker count for better parallelism with large datasets
     let batch_size = if logs.len() > 100_000 {
         (logs.len() / 1000).max(500)
@@ -879,6 +886,8 @@ async fn cluster_logs_parallel(
         }
     }
 
+    let clustering_duration = start.elapsed();
+
     // Finish batch processing progress bar
     if let Some(pb_mutex) = batch_progress {
         let pb = pb_mutex.lock();
@@ -905,6 +914,7 @@ async fn cluster_logs_parallel(
     };
 
     // Merge similar clusters across workers using the original merge function
+    let merge_start = Instant::now();
     let merged_clusters = merge_clusters(
         all_clusters,
         similarity_threshold,
@@ -912,6 +922,7 @@ async fn cluster_logs_parallel(
         merge_progress.as_ref(),
     )
     .await;
+    let merge_duration = merge_start.elapsed();
 
     if let Some(pb) = merge_progress {
         pb.finish_with_message("Cluster merging complete!");
@@ -941,6 +952,13 @@ async fn cluster_logs_parallel(
             "Parallel clustering complete! Created {} clusters",
             sorted_clusters.len()
         );
+        let pool = string_pool.lock();
+        println!(
+            "DEBUG_PERFORMANCE: Parallel clustering timing: clustering phase = {:?}, merging phase = {:?}, string pool lock count = {}",
+            clustering_duration,
+            merge_duration,
+            pool.lock_count.load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 
     sorted_clusters
@@ -964,7 +982,7 @@ async fn merge_clusters(
 
     for (i, cluster) in clusters.into_iter().enumerate() {
         let mut found_merge = false;
-        let string_pool_guard = string_pool.lock();
+        let string_pool_guard = lock_and_count(string_pool);
 
         if let Some(cluster_text) = string_pool_guard.get_string(cluster.normalized_text_id) {
             // Check if this cluster can be merged with any existing one
@@ -1017,6 +1035,13 @@ async fn merge_clusters(
     merged
 }
 
+// Helper to increment lock count
+fn lock_and_count<'a>(pool: &'a SharedStringPool) -> parking_lot::MutexGuard<'a, MmapStringPool> {
+    let guard = pool.lock();
+    guard.lock_count.fetch_add(1, Ordering::Relaxed);
+    guard
+}
+
 // Process a single log item with the shared string pool
 async fn process_log_item(
     work_item: WorkItem,
@@ -1032,6 +1057,7 @@ async fn process_log_item(
         return;
     }
 
+    // Extract words and normalized text without holding the lock
     let (words, normalized_text) = normalizer.extract_words_and_normalized(&log_line);
 
     // Skip lines with no meaningful words
@@ -1049,29 +1075,30 @@ async fn process_log_item(
         clusters.len()
     };
 
-    // Lock the string pool for similarity checks
-    let string_pool_guard = string_pool.lock();
-
-    for (i, cluster) in clusters.iter().enumerate().take(check_limit) {
-        let similarity = cluster.similarity_to(&normalized_text, &string_pool_guard);
-        if similarity > max_similarity {
-            max_similarity = similarity;
-            if similarity >= similarity_threshold {
-                best_match_index = Some(i);
-                break; // Early exit on good match
+    // Only lock the string pool for the similarity checks
+    {
+        let string_pool_guard = lock_and_count(string_pool);
+        for (i, cluster) in clusters.iter().enumerate().take(check_limit) {
+            let similarity = cluster.similarity_to(&normalized_text, &string_pool_guard);
+            if similarity > max_similarity {
+                max_similarity = similarity;
+                if similarity >= similarity_threshold {
+                    best_match_index = Some(i);
+                    break; // Early exit on good match
+                }
             }
         }
     }
-    drop(string_pool_guard);
 
     if let Some(index) = best_match_index {
-        let mut string_pool_guard = string_pool.lock();
+        // Only lock for the minimal time needed to add a member
+        let mut string_pool_guard = lock_and_count(string_pool);
         clusters[index].add_member(&log_line, metadata, &mut string_pool_guard);
     } else {
         // Limit total clusters to prevent memory issues
         if clusters.len() < 50 {
-            // Lower limit per worker for memory efficiency
-            let mut string_pool_guard = string_pool.lock();
+            // Only lock for the minimal time needed to create a new cluster
+            let mut string_pool_guard = lock_and_count(string_pool);
             let new_cluster = OptimizedLogCluster::new(
                 &log_line,
                 words,
