@@ -488,6 +488,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pod_list = pods_api.list(&list_params).await?;
 
+    // Remove all println! except for progress bar and final stats in human mode
     if !cli.json {
         println!("Found {} pods", pod_list.items.len());
     }
@@ -509,16 +510,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let pod_name_clone = pod_name.clone();
                 let namespace_clone = namespace.clone();
                 let since = cli.since.clone();
-                let json_mode = cli.json;
 
                 let task = task::spawn(async move {
-                    if !json_mode {
-                        println!(
-                            "Fetching logs from pod: {}, container: {}",
-                            pod_name_clone, container_name
-                        );
-                    }
-
                     // Create namespace-specific client for log fetching
                     let namespace_pods_api: Api<Pod> =
                         Api::namespaced(client_clone, &namespace_clone);
@@ -537,15 +530,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match namespace_pods_api.logs(&pod_name_clone, &log_params).await {
                         Ok(logs) => {
                             let lines: Vec<String> = logs.lines().map(|s| s.to_string()).collect();
-                            if !json_mode {
-                                println!(
-                                    "  Fetched {} lines from {}/{}",
-                                    lines.len(),
-                                    pod_name_clone,
-                                    container_name
-                                );
-                            }
-
                             // Create metadata for each log line
                             let log_entries: Vec<(String, LogMetadata)> = lines
                                 .into_iter()
@@ -562,9 +546,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(log_entries)
                         }
                         Err(e) => {
-                            if !json_mode {
-                                eprintln!("Error fetching logs for pod {}: {}", pod_name_clone, e);
-                            }
+                            // Removed per-pod/container error eprintln! here
+                            // Only progress bar and final stats will be shown
                             Err(e)
                         }
                     }
@@ -622,7 +605,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(pb) = fetch_progress {
         pb.finish_with_message("Log fetching complete!");
     }
-
     if !cli.json {
         println!(
             "Finished fetching all logs. Total lines: {}",
@@ -677,7 +659,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(pb) = filter_progress {
             pb.finish_with_message("Filtering complete!");
         }
-
         if !cli.json {
             println!(
                 "Applied filter {:?}: {} lines -> {} lines ({:.1}% retained)",
@@ -722,8 +703,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Cluster {}: (Count: {})", i + 1, cluster.count);
             println!("  Representative: {}", cluster.representative);
             println!("  Key words: {:?}", cluster.words);
-
-            // Show sources (namespace/pod/container)
             println!("  Sources:");
             for source in &cluster.sources {
                 println!(
@@ -771,11 +750,13 @@ async fn cluster_logs_parallel(
     let start = Instant::now();
 
     // Optimized batch size and worker count for better parallelism with large datasets
-    let batch_size = if logs.len() > 100_000 {
+    const BATCH_SIZE_FACTOR: usize = 4; // Tune this factor for your workload
+    let base_batch_size = if logs.len() > 100_000 {
         (logs.len() / 1000).max(500)
     } else {
         1000
     };
+    let batch_size = base_batch_size * BATCH_SIZE_FACTOR;
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get().min(16))
         .unwrap_or(8);
@@ -823,7 +804,7 @@ async fn cluster_logs_parallel(
 
     // Spawn worker tasks
     let mut worker_handles = Vec::new();
-    for worker_id in 0..num_workers {
+    for _ in 0..num_workers {
         let receiver = receiver.clone();
         let string_pool = Arc::clone(&string_pool);
         let batch_progress = batch_progress.as_ref().map(Arc::clone);
@@ -831,18 +812,9 @@ async fn cluster_logs_parallel(
         let handle = task::spawn(async move {
             let mut normalizer = LogNormalizer::new();
             let mut worker_clusters: Vec<OptimizedLogCluster> = Vec::new();
-            let mut batches_processed = 0;
+            let _batches_processed = 0; // Renamed to suppress warning
 
             while let Ok(batch) = receiver.recv() {
-                batches_processed += 1;
-                if !json_mode {
-                    println!(
-                        "Worker {} processing batch of {} items",
-                        worker_id,
-                        batch.len()
-                    );
-                }
-
                 for work_item in batch {
                     process_log_item(
                         work_item,
@@ -859,15 +831,6 @@ async fn cluster_logs_parallel(
                     let pb = pb_mutex.lock();
                     pb.inc(1);
                 }
-            }
-
-            if !json_mode {
-                println!(
-                    "Worker {} completed: {} batches processed, {} clusters created",
-                    worker_id,
-                    batches_processed,
-                    worker_clusters.len()
-                );
             }
 
             worker_clusters
@@ -892,39 +855,16 @@ async fn cluster_logs_parallel(
         pb.finish_with_message("Batch processing complete!");
     }
 
-    if !json_mode {
-        println!("Collected {} clusters from all workers", all_clusters.len());
-    }
-
-    // Create progress bar for cluster merging
-    let merge_progress = if !json_mode && all_clusters.len() > 1 {
-        let pb = ProgressBar::new(all_clusters.len() as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.magenta/blue}] {pos}/{len} {msg}")
-                .unwrap()
-                .progress_chars("#>-"),
-        );
-        pb.set_message("Merging clusters across workers...");
-        Some(pb)
-    } else {
-        None
-    };
-
     // Merge similar clusters across workers using the original merge function
     let merge_start = Instant::now();
     let merged_clusters = merge_clusters(
         all_clusters,
         similarity_threshold,
         &string_pool,
-        merge_progress.as_ref(),
+        None, // No progress bar for merging in human mode
     )
     .await;
     let merge_duration = merge_start.elapsed();
-
-    if let Some(pb) = merge_progress {
-        pb.finish_with_message("Cluster merging complete!");
-    }
 
     if !json_mode {
         println!(
