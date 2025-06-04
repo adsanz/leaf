@@ -54,6 +54,12 @@ struct Cli {
         default_value = "10"
     )]
     fetch_limit: usize,
+    #[clap(
+        long,
+        help = "Batch size multiplier for clustering (default: 4) - increases parallelism for large datasets",
+        default_value = "4"
+    )]
+    batch_size_factor: usize,
 }
 
 // Memory-mapped string pool for efficient string storage
@@ -334,6 +340,63 @@ impl LogNormalizer {
         }
     }
 
+    fn is_nonsense_word(word: &str) -> bool {
+        let len: usize = word.len();
+        if len > 20 {
+            return true;
+        }
+        let digit_count = word.chars().filter(|c| c.is_ascii_digit()).count();
+        if digit_count > len / 2 {
+            return true;
+        }
+        if len > 8 && word.chars().all(|c| c.is_ascii_hexdigit()) {
+            return true;
+        }
+        // Exclude words with low alphabetic ratio (e.g., v1beta1, k8s, etc.)
+        let alpha_count = word.chars().filter(|c| c.is_ascii_alphabetic()).count();
+        if alpha_count < len.div_ceil(2) {
+            return true;
+        }
+        // Optionally, filter out common stopwords (add more as needed)
+        matches!(
+            word,
+            "the"
+                | "and"
+                | "for"
+                | "has"
+                | "have"
+                | "with"
+                | "from"
+                | "that"
+                | "this"
+                | "was"
+                | "are"
+                | "but"
+                | "not"
+                | "can"
+                | "will"
+                | "all"
+                | "any"
+                | "api"
+                | "io"
+                | "it"
+                | "on"
+                | "in"
+                | "of"
+                | "to"
+                | "by"
+                | "as"
+                | "is"
+                | "be"
+                | "or"
+                | "if"
+                | "no"
+                | "because"
+                | "at"
+                | "an"
+        )
+    }
+
     fn extract_words_and_normalized(&mut self, log_line: &str) -> (Vec<String>, String) {
         // Check cache first
         if let Some(cached) = self.cache.get(log_line) {
@@ -362,8 +425,10 @@ impl LogNormalizer {
                 current_word.push(lower_ch);
                 normalized_chars.push(lower_ch);
             } else {
-                if !current_word.is_empty() && current_word.len() >= 3 {
-                    // Only keep meaningful words (3+ chars)
+                if !current_word.is_empty()
+                    && current_word.len() >= 3
+                    && !Self::is_nonsense_word(&current_word)
+                {
                     words.push(current_word.clone());
                 }
                 current_word.clear();
@@ -375,7 +440,10 @@ impl LogNormalizer {
         }
 
         // Add the last word if it exists
-        if !current_word.is_empty() && current_word.len() >= 3 {
+        if !current_word.is_empty()
+            && current_word.len() >= 3
+            && !Self::is_nonsense_word(&current_word)
+        {
             words.push(current_word);
         }
 
@@ -677,7 +745,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         all_log_lines
     };
 
-    let clusters = cluster_logs_parallel(filtered_logs, cli.threshold, cli.json).await;
+    let clusters = cluster_logs_parallel(
+        filtered_logs,
+        cli.threshold,
+        cli.json,
+        cli.batch_size_factor,
+    )
+    .await;
 
     if cli.json {
         // Apply member limit if specified for JSON output
@@ -721,6 +795,7 @@ async fn cluster_logs_parallel(
     logs: Vec<(String, LogMetadata)>,
     similarity_threshold: f64,
     json_mode: bool,
+    batch_size_factor: usize,
 ) -> Vec<LogCluster> {
     if logs.is_empty() {
         return Vec::new();
@@ -750,13 +825,12 @@ async fn cluster_logs_parallel(
     let start = Instant::now();
 
     // Optimized batch size and worker count for better parallelism with large datasets
-    const BATCH_SIZE_FACTOR: usize = 4; // Tune this factor for your workload
     let base_batch_size = if logs.len() > 100_000 {
         (logs.len() / 1000).max(500)
     } else {
         1000
     };
-    let batch_size = base_batch_size * BATCH_SIZE_FACTOR;
+    let batch_size = base_batch_size * batch_size_factor;
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get().min(16))
         .unwrap_or(8);
