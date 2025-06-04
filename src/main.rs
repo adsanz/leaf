@@ -1,7 +1,7 @@
 // Kubernetes log clustering with sorensen_dice similarity
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use crossbeam_deque::Injector;
+use crossbeam_channel;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use k8s_openapi::api::core::v1::Pod;
@@ -765,13 +765,13 @@ async fn cluster_logs_parallel(
 
     // Optimized batch size and worker count for better parallelism with large datasets
     let batch_size = if logs.len() > 100_000 {
-        (logs.len() / 1000).max(500) // Minimum 500, scale with dataset size
+        (logs.len() / 1000).max(500)
     } else {
         1000
     };
     let num_workers = std::thread::available_parallelism()
-        .map(|n| n.get().min(16)) // Cap at 16 workers
-        .unwrap_or(8); // Default to 8 workers if detection fails
+        .map(|n| n.get().min(16))
+        .unwrap_or(8);
 
     let batches: Vec<Vec<WorkItem>> = logs
         .into_iter()
@@ -807,16 +807,17 @@ async fn cluster_logs_parallel(
         None
     };
 
-    // Use only a global queue for all batches
-    let global_queue = Arc::new(Injector::new());
+    // Use crossbeam_channel for work distribution
+    let (sender, receiver) = crossbeam_channel::unbounded();
     for batch in batches {
-        global_queue.push(batch);
+        sender.send(batch).unwrap();
     }
+    drop(sender); // Close the channel
 
     // Spawn worker tasks
     let mut worker_handles = Vec::new();
     for worker_id in 0..num_workers {
-        let global_queue = Arc::clone(&global_queue);
+        let receiver = receiver.clone();
         let string_pool = Arc::clone(&string_pool);
         let batch_progress = batch_progress.as_ref().map(Arc::clone);
 
@@ -825,13 +826,7 @@ async fn cluster_logs_parallel(
             let mut worker_clusters: Vec<OptimizedLogCluster> = Vec::new();
             let mut batches_processed = 0;
 
-            loop {
-                let batch = global_queue.steal().success();
-                let batch = match batch {
-                    Some(batch) => batch,
-                    None => break,
-                };
-
+            while let Ok(batch) = receiver.recv() {
                 batches_processed += 1;
                 if !json_mode {
                     println!(
