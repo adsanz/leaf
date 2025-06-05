@@ -60,6 +60,13 @@ struct Cli {
         default_value = "4"
     )]
     batch_size_factor: usize,
+    #[clap(
+        long,
+        help = "Disable nonsense-word filtering for clustering (not recommended)",
+        action,
+        default_value_t = true
+    )]
+    no_word_filter: bool,
 }
 
 // Memory-mapped string pool for efficient string storage
@@ -331,12 +338,14 @@ struct WorkItem {
 // Ultra-fast log normalizer using word extraction and string normalization
 struct LogNormalizer {
     cache: AHashMap<String, (Vec<String>, String)>,
+    no_word_filter: bool,
 }
 
 impl LogNormalizer {
-    fn new() -> Self {
+    fn new_with_filter(no_word_filter: bool) -> Self {
         LogNormalizer {
             cache: AHashMap::new(),
+            no_word_filter,
         }
     }
 
@@ -374,7 +383,11 @@ impl LogNormalizer {
             return cached.clone();
         }
 
-        let (words, normalized) = self.fast_extract_words_and_normalized(log_line);
+        let (words, normalized) = if self.no_word_filter {
+            self.fast_extract_words_and_normalized(log_line)
+        } else {
+            self.fast_extract_words_and_normalized_no_filter(log_line)
+        };
 
         // Cache the result (limit cache size)
         if self.cache.len() < 5000 {
@@ -413,6 +426,27 @@ impl LogNormalizer {
         }
 
         // Normalized string is now just the filtered words joined by space
+        let normalized_string = words.join(" ");
+        (words, normalized_string)
+    }
+
+    fn fast_extract_words_and_normalized_no_filter(&self, log_line: &str) -> (Vec<String>, String) {
+        let mut words = Vec::new();
+        let mut current_word = String::new();
+        for ch in log_line.chars() {
+            if ch.is_alphabetic() {
+                let lower_ch = ch.to_ascii_lowercase();
+                current_word.push(lower_ch);
+            } else {
+                if !current_word.is_empty() && current_word.len() >= 3 {
+                    words.push(current_word.clone());
+                }
+                current_word.clear();
+            }
+        }
+        if !current_word.is_empty() && current_word.len() >= 3 {
+            words.push(current_word);
+        }
         let normalized_string = words.join(" ");
         (words, normalized_string)
     }
@@ -716,6 +750,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.threshold,
         cli.json,
         cli.batch_size_factor,
+        cli.no_word_filter,
     )
     .await;
 
@@ -762,6 +797,7 @@ async fn cluster_logs_parallel(
     similarity_threshold: f64,
     json_mode: bool,
     batch_size_factor: usize,
+    no_word_filter: bool,
 ) -> Vec<LogCluster> {
     if logs.is_empty() {
         return Vec::new();
@@ -784,7 +820,7 @@ async fn cluster_logs_parallel(
                     e
                 );
             }
-            return cluster_logs_fallback(logs, similarity_threshold, json_mode);
+            return cluster_logs_fallback(logs, similarity_threshold, json_mode, no_word_filter);
         }
     };
 
@@ -850,7 +886,7 @@ async fn cluster_logs_parallel(
         let batch_progress = batch_progress.as_ref().map(Arc::clone);
 
         let handle = task::spawn(async move {
-            let mut normalizer = LogNormalizer::new();
+            let mut normalizer = LogNormalizer::new_with_filter(no_word_filter);
             let mut worker_clusters: Vec<OptimizedLogCluster> = Vec::new();
             let _batches_processed = 0; // Renamed to suppress warning
 
@@ -1094,8 +1130,9 @@ fn cluster_logs_fallback(
     logs: Vec<(String, LogMetadata)>,
     similarity_threshold: f64,
     json_mode: bool,
+    no_word_filter: bool,
 ) -> Vec<LogCluster> {
-    let mut normalizer = LogNormalizer::new();
+    let mut normalizer = LogNormalizer::new_with_filter(no_word_filter);
     cluster_logs(logs, similarity_threshold, &mut normalizer, json_mode)
 }
 
