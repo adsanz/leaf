@@ -1,4 +1,4 @@
-# 🍃 leaf: Fast Kubernetes Log Clustering Tool
+# 🍃 leaf: Log Error & Anomaly Finder
 
 # Under development
 
