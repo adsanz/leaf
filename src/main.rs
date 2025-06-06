@@ -1,57 +1,21 @@
 // Kubernetes log clustering with sorensen_dice similarity
 use ahash::{AHashMap, AHashSet};
-use chrono::Utc; // Keep Utc, remove DateTime if it's not used elsewhere
+use chrono::{DateTime, Utc};
 use clap::Parser;
-use futures::io::AsyncBufReadExt;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use k8s_openapi::api::core::v1::Pod;
-use kube::{
-    Client,
-    api::{Api, ListParams, LogParams}, // Added LogParams
-};
+use kube::api::{ListParams, LogParams};
+use kube::{Api, Client};
 use memmap2::{MmapMut, MmapOptions};
-use parking_lot::Mutex; // Added for SharedStringPool
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::io::{Seek, SeekFrom};
-use std::sync::Arc; // Added for SharedStringPool
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant; // Added for timing
+use std::time::Instant;
 use textdistance::str::sorensen_dice;
 use tokio::task;
-
-const MIN_MMAP_POOL_CAPACITY_MB: usize = 4;
-const MAX_MMAP_POOL_CAPACITY_MB: usize = 2048;
-
-// Helper function to parse duration strings like "1h", "10m", "30s" into seconds
-fn parse_duration_to_seconds(duration_str: &str) -> Result<i64, String> {
-    if duration_str.ends_with('s') {
-        duration_str
-            .trim_end_matches('s')
-            .parse::<i64>()
-            .map_err(|e| format!("Invalid seconds value: {}", e))
-    } else if duration_str.ends_with('m') {
-        duration_str
-            .trim_end_matches('m')
-            .parse::<i64>()
-            .map(|m| m * 60)
-            .map_err(|e| format!("Invalid minutes value: {}", e))
-    } else if duration_str.ends_with('h') {
-        duration_str
-            .trim_end_matches('h')
-            .parse::<i64>()
-            .map(|h| h * 3600)
-            .map_err(|e| format!("Invalid hours value: {}", e))
-    } else if let Ok(num) = duration_str.parse::<i64>() {
-        // Assume seconds if no suffix and is a plain number
-        Ok(num)
-    } else {
-        Err(format!(
-            "Invalid duration format: {}. Use 'h', 'm', or 's' suffix, or a plain number for seconds.",
-            duration_str
-        ))
-    }
-}
 
 #[derive(Serialize, Debug)]
 struct ErrorEntry {
@@ -75,13 +39,8 @@ struct Cli {
     threshold: f64,
     #[clap(short, long)]
     json: bool,
-    #[clap(
-        short,
-        long,
-        help = "Filter logs since a specific duration (e.g., '1h', '10m', '30s')"
-    )]
-    #[clap(value_parser = parse_duration_to_seconds)]
-    since: Option<i64>,
+    #[clap(short, long)]
+    since: Option<String>,
     #[clap(
         short = 'f',
         long,
@@ -368,14 +327,18 @@ impl OptimizedLogCluster {
         // in the current workflow (JSON output or console printing).
         // Initializing them as empty saves computation and memory, especially when
         // member_limit is 0 and 'members'/'sources' vectors can be large.
+        let members_set = AHashSet::new();
+        let sources_set = AHashSet::new();
 
         LogCluster {
             representative,
             normalized_text,
             words,
             members,           // Members vector is now potentially smaller
+            members_set,       // Now an empty set
             count: self.count, // Count still reflects the total number of original members
             sources,
+            sources_set, // Now an empty set
         }
     }
 }
@@ -383,7 +346,7 @@ impl OptimizedLogCluster {
 // Work item for parallel processing
 #[derive(Debug, Clone)]
 struct WorkItem {
-    log_line_id: usize, // Changed from log_line: String to log_line_id: usize
+    log_line: String,
     metadata: LogMetadata,
 }
 
@@ -522,14 +485,18 @@ struct LogMetadata {
 }
 
 // Simplified LogCluster with sorensen_dice-based clustering
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct LogCluster {
     representative: String,
     normalized_text: String,
     words: Vec<String>,
     members: Vec<String>,
+    #[serde(skip)] // Skip serialization for performance sets
+    members_set: AHashSet<String>, // O(1) deduplication lookup
     count: usize,
     sources: Vec<LogMetadata>,
+    #[serde(skip)] // Skip serialization for performance sets
+    sources_set: AHashSet<(String, String, String)>, // O(1) source deduplication lookup
 }
 
 #[derive(Serialize)]
@@ -538,309 +505,152 @@ struct JsonOutput {
     errors: Vec<ErrorEntry>,
 }
 
+impl LogCluster {
+    fn new(log_line: String, normalizer: &mut LogNormalizer, metadata: LogMetadata) -> Self {
+        let (words, normalized_text) = normalizer.extract_words_and_normalized(&log_line);
+
+        let mut members_set = AHashSet::new();
+        members_set.insert(log_line.clone());
+
+        let mut sources_set = AHashSet::new();
+        sources_set.insert((
+            metadata.namespace.clone(),
+            metadata.pod.clone(),
+            metadata.container.clone(),
+        ));
+
+        LogCluster {
+            representative: log_line.clone(),
+            normalized_text,
+            words,
+            members: vec![log_line],
+            members_set,
+            count: 1,
+            sources: vec![metadata],
+            sources_set,
+        }
+    }
+
+    fn add_member(&mut self, log_line: String, metadata: LogMetadata) {
+        // Only add if not already present (O(1) lookup)
+        if !self.members_set.contains(&log_line) {
+            self.members.push(log_line.clone());
+            self.members_set.insert(log_line);
+            self.count += 1;
+        }
+
+        let source_key = (
+            metadata.namespace.clone(),
+            metadata.pod.clone(),
+            metadata.container.clone(),
+        );
+
+        // Add source metadata if not already present (O(1) lookup)
+        if !self.sources_set.contains(&source_key) {
+            self.sources.push(metadata);
+            self.sources_set.insert(source_key);
+        }
+    }
+
+    fn similarity_to(&self, normalized_text: &str) -> f64 {
+        sorensen_dice_similarity(&self.normalized_text, normalized_text)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let client = Client::try_default().await.map_err(|e| {
-        eprintln!("Failed to create Kubernetes client: {}", e);
-        Box::<dyn std::error::Error>::from(e)
-    })?;
+    let client = Client::try_default().await?;
 
     // Get pod list - use all namespaces if none specified
-    let pods_api_all_ns: Api<Pod> = Api::all(client.clone()); // For pre-fetch, might need specific ns later
+    let pods_api: Api<Pod> = if let Some(ref namespace) = cli.namespace {
+        Api::namespaced(client.clone(), namespace)
+    } else {
+        Api::all(client.clone())
+    };
 
     let mut list_params = ListParams::default();
     if let Some(ref label) = cli.label {
         list_params = list_params.labels(label);
     }
-    // If a namespace is specified in CLI, use it for pod listing.
-    // Otherwise, list_params will apply to all namespaces.
-    let pod_list_api_target = if let Some(ref namespace) = cli.namespace {
-        Api::namespaced(client.clone(), namespace)
-    } else {
-        pods_api_all_ns.clone() // Use the Api::all() version
-    };
 
-    let pod_list = pod_list_api_target.list(&list_params).await.map_err(|e| {
-        eprintln!("Failed to list pods: {}", e);
-        Box::<dyn std::error::Error>::from(e)
-    })?;
+    let pod_list = pods_api.list(&list_params).await?;
 
+    // Remove all println! except for progress bar and final stats in human mode
     if !cli.json {
-        println!("Found {} pods matching criteria", pod_list.items.len());
+        println!("Found {} pods", pod_list.items.len());
     }
 
-    let since_seconds: Option<i64> = cli.since;
-
-    // --- Pre-fetch Phase ---
-    let prefetch_start_time = Instant::now();
-    let mut prefetch_tasks = Vec::new();
-    let mut total_prefetch_containers = 0;
-
-    if !cli.json {
-        println!("Starting pre-fetch phase to estimate log volume...");
-    }
-
-    for pod in &pod_list.items {
-        let pod_name = pod.metadata.name.as_ref().cloned().unwrap_or_default();
-        let namespace = pod.metadata.namespace.as_ref().cloned().unwrap_or_default();
-
-        if let Some(containers) = pod.spec.as_ref().map(|s| &s.containers) {
-            for container in containers {
-                total_prefetch_containers += 1;
-                let client_clone = client.clone();
-                let namespace_clone = namespace.clone();
-                let pod_name_clone = pod_name.clone();
-                let container_name_clone = container.name.clone();
-                let since_seconds_clone = since_seconds;
-
-                let task = tokio::spawn(async move {
-                    let logs_api: Api<Pod> = Api::namespaced(client_clone, &namespace_clone);
-                    let lp = LogParams {
-                        container: Some(container_name_clone.clone()),
-                        timestamps: false, // No need for timestamps in pre-fetch
-                        since_seconds: since_seconds_clone,
-                        ..Default::default()
-                    };
-
-                    let mut line_count: usize = 0;
-                    let mut byte_count: usize = 0;
-
-                    match logs_api.log_stream(&pod_name_clone, &lp).await {
-                        Ok(buf_reader) => {
-                            // MODIFIED: was `stream`
-                            let mut lines_stream = buf_reader.lines(); // ADDED
-                            while let Some(result) = lines_stream.next().await {
-                                // MODIFIED
-                                match result {
-                                    // result is io::Result<String>
-                                    Ok(line_str) => {
-                                        // MODIFIED: was Ok(bytes)
-                                        line_count += 1;
-                                        byte_count += line_str.len(); // MODIFIED: was bytes.len()
-                                    }
-                                    Err(e) => {
-                                        // MODIFIED: e is std::io::Error
-                                        return Err(ErrorEntry {
-                                            timestamp: Utc::now().to_rfc3339(),
-                                            location: format!(
-                                                "log_stream_lines_prefetch {}/{}",
-                                                pod_name_clone, container_name_clone
-                                            ),
-                                            error: format!(
-                                                "Log stream line error during prefetch: {}",
-                                                e
-                                            ),
-                                        });
-                                    }
-                                }
-                            }
-                            Ok((line_count, byte_count))
-                        }
-                        Err(e) => Err(ErrorEntry {
-                            timestamp: Utc::now().to_rfc3339(),
-                            location: format!(
-                                "get_log_stream_prefetch {}/{}",
-                                pod_name_clone, container_name_clone
-                            ),
-                            error: format!("Failed to get log stream during prefetch: {}", e),
-                        }),
-                    }
-                });
-                prefetch_tasks.push(task);
-            }
-        }
-    }
-
-    let prefetch_progress = {
-        let pb = ProgressBar::new(total_prefetch_containers as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.cyan} [{elapsed_precise}] [{bar:40.green/blue}] {pos}/{len} ({per_sec}) {msg}")
-                .unwrap()
-                .progress_chars("=> "),
-        );
-        pb.set_message("Pre-fetching log stats");
-        if cli.json {
-            pb.set_draw_target(ProgressDrawTarget::hidden()); // Or stderr()
-        }
-        Arc::new(Mutex::new(pb))
-    };
-
-    let mut total_log_lines_estimated: usize = 0;
-    let mut total_log_bytes_estimated: usize = 0;
-    let mut prefetch_error_list: Vec<ErrorEntry> = Vec::new();
-
-    let prefetch_stream = stream::iter(prefetch_tasks).buffer_unordered(cli.fetch_limit.max(1)); // Use fetch_limit for prefetch concurrency
-
-    futures::pin_mut!(prefetch_stream); // Pin the stream for iteration
-
-    while let Some(result) = prefetch_stream.next().await {
-        match result {
-            Ok(Ok((lines, bytes))) => {
-                total_log_lines_estimated += lines;
-                total_log_bytes_estimated += bytes;
-            }
-            Ok(Err(error_entry)) => {
-                prefetch_error_list.push(error_entry);
-            }
-            Err(e) => {
-                // JoinError
-                if !cli.json {
-                    eprintln!("Prefetch task panicked: {}", e);
-                }
-                // Optionally create an ErrorEntry for JoinErrors if needed
-            }
-        }
-        let pb = prefetch_progress.lock();
-        pb.inc(1);
-    }
-
-    {
-        let pb = prefetch_progress.lock();
-        pb.finish_with_message("Pre-fetch complete!");
-    }
-
-    let prefetch_duration = prefetch_start_time.elapsed();
-    if !cli.json {
-        println!(
-            "Pre-fetch phase complete in {:?}. Estimated total lines: {}, Estimated total bytes: {} (approx. {:.2} MB)",
-            prefetch_duration,
-            total_log_lines_estimated,
-            total_log_bytes_estimated,
-            total_log_bytes_estimated as f64 / (1024.0 * 1024.0)
-        );
-        if !prefetch_error_list.is_empty() {
-            println!(
-                "Encountered {} errors during pre-fetch:",
-                prefetch_error_list.len()
-            );
-            // for error_entry in prefetch_error_list.iter().take(5) { // Print a few
-            //     eprintln!("  Pod: {}, Container: {}, Error: {}", error_entry.pod, error_entry.container, error_entry.error);
-            // }
-        }
-    }
-
-    // Initialize MmapStringPool based on pre-fetch estimates
-    let string_pool_capacity_mb = {
-        let calculated_capacity_mb =
-            ((total_log_bytes_estimated as f64 * 2.0) / (1024.0 * 1024.0)).ceil() as usize;
-        calculated_capacity_mb.clamp(MIN_MMAP_POOL_CAPACITY_MB, MAX_MMAP_POOL_CAPACITY_MB)
-    };
-
-    if !cli.json {
-        println!(
-            "Initializing MmapStringPool with calculated capacity: {} MB (Min: {}MB, Max: {}MB)",
-            string_pool_capacity_mb, MIN_MMAP_POOL_CAPACITY_MB, MAX_MMAP_POOL_CAPACITY_MB
-        );
-    }
-
-    let string_pool = match MmapStringPool::new(string_pool_capacity_mb) {
-        Ok(pool) => Arc::new(Mutex::new(pool)),
-        Err(e) => {
-            if !cli.json {
-                eprintln!(
-                    "Fatal: Failed to create memory-mapped pool with calculated capacity ({}MB): {}. Check available memory and permissions.",
-                    string_pool_capacity_mb, e
-                );
-            }
-            // Decide if to fallback or exit. For now, exiting as it's a core part.
-            return Err(Box::<dyn std::error::Error>::from(format!(
-                "MmapStringPool creation failed: {}",
-                e
-            )));
-        }
-    };
-
-    // --- Actual Log Fetching Phase ---
-    let mut all_log_lines: Vec<(usize, LogMetadata)> = Vec::new(); // Changed to Vec<(usize, LogMetadata)> for StringId
-    let mut error_list = prefetch_error_list; // Start with errors from pre-fetch
+    let mut all_log_lines = Vec::new();
+    let mut error_list = Vec::new();
 
     // Create tasks for concurrent log fetching
     let mut tasks = Vec::new();
-    let mut total_fetch_containers = 0;
 
     for pod in pod_list.items {
-        // Re-iterate pod_list, or store needed info from pre-fetch if pod_list is consumed
-        let pod_name = pod.metadata.name.as_ref().cloned().unwrap_or_default();
-        let namespace = pod.metadata.namespace.as_ref().cloned().unwrap_or_default();
+        let pod_name = pod.metadata.name.unwrap_or_default();
+        let namespace = pod.metadata.namespace.unwrap_or_default();
 
+        // Process all containers in the pod
         if let Some(containers) = pod.spec.as_ref().map(|s| &s.containers) {
             for container in containers {
-                total_fetch_containers += 1;
-                let client_clone = client.clone(); // Clone client for the task
-                let namespace_clone = namespace.clone();
+                let container_name = container.name.clone();
+                let client_clone = client.clone();
                 let pod_name_clone = pod_name.clone();
-                let container_name_clone = container.name.clone();
-                let since_seconds_clone = since_seconds;
-                let string_pool_fetch_clone = Arc::clone(&string_pool); // Clone for the fetching task
+                let namespace_clone = namespace.clone();
+                let since = cli.since.clone();
 
-                let task = tokio::spawn(async move {
-                    let logs_api: Api<Pod> = Api::namespaced(client_clone, &namespace_clone);
-                    let lp = LogParams {
-                        container: Some(container_name_clone.clone()),
-                        timestamps: true,
-                        since_seconds: since_seconds_clone,
+                let task = task::spawn(async move {
+                    // Create namespace-specific client for log fetching
+                    let namespace_pods_api: Api<Pod> =
+                        Api::namespaced(client_clone, &namespace_clone);
+
+                    let mut log_params = LogParams {
+                        container: Some(container_name.clone()),
                         ..Default::default()
                     };
 
-                    let mut log_entries: Vec<(usize, LogMetadata)> = Vec::new(); // For StringId
-                    let metadata = LogMetadata {
-                        namespace: namespace_clone.clone(),
-                        pod: pod_name_clone.clone(),
-                        container: container_name_clone.clone(), // Ensured container is part of metadata
-                    };
+                    if let Some(ref since_str) = since {
+                        if let Ok(since_time) = DateTime::parse_from_rfc3339(since_str) {
+                            log_params.since_time = Some(since_time.with_timezone(&Utc));
+                        }
+                    }
 
-                    match logs_api.log_stream(&pod_name_clone, &lp).await {
-                        Ok(buf_reader) => {
-                            // MODIFIED: was `stream`
-                            let mut lines_stream = buf_reader.lines(); // ADDED
-                            while let Some(result) = lines_stream.next().await {
-                                // MODIFIED
-                                match result {
-                                    // result is io::Result<String>
-                                    Ok(line_str) => {
-                                        // MODIFIED: was Ok(bytes)
-                                        // Lock the pool for each string operation and immediately release
-                                        let line_id = {
-                                            let mut pool_guard = string_pool_fetch_clone.lock();
-                                            pool_guard.intern_string(&line_str)
-                                        };
-                                        if line_id != usize::MAX {
-                                            log_entries.push((line_id, metadata.clone()));
-                                        } else {
-                                            // Pool full, original code skipped.
-                                        }
-                                        // Removed the `else { /* UTF8 error */ }` branch.
-                                    }
-                                    Err(e) => {
-                                        // MODIFIED: e is std::io::Error
-                                        return Err(ErrorEntry {
-                                            timestamp: Utc::now().to_rfc3339(),
-                                            location: format!(
-                                                "log_stream_lines {}/{}",
-                                                pod_name_clone,
-                                                container_name_clone.clone()
-                                            ),
-                                            error: format!("Log stream line error: {}", e),
-                                        });
-                                    }
-                                }
-                            }
+                    match namespace_pods_api.logs(&pod_name_clone, &log_params).await {
+                        Ok(logs) => {
+                            let lines: Vec<String> = logs.lines().map(|s| s.to_string()).collect();
+                            // Create metadata for each log line
+                            let log_entries: Vec<(String, LogMetadata)> = lines
+                                .into_iter()
+                                .map(|line| {
+                                    (
+                                        line,
+                                        LogMetadata {
+                                            namespace: namespace_clone.clone(),
+                                            pod: pod_name_clone.clone(),
+                                            container: container_name.clone(),
+                                        },
+                                    )
+                                })
+                                .collect();
+
                             Ok(log_entries)
                         }
-                        Err(e) => Err(ErrorEntry {
-                            timestamp: Utc::now().to_rfc3339(),
-                            location: format!(
-                                "get_log_stream {}/{}",
-                                pod_name_clone,
-                                container_name_clone.clone()
-                            ),
-                            error: format!("Failed to get log stream: {}", e),
-                        }),
+                        Err(e) => {
+                            let error_entry = ErrorEntry {
+                                error: e.to_string(),
+                                location: format!(
+                                    "pod: {}, container: {}",
+                                    pod_name_clone, container_name
+                                ),
+                                timestamp: Utc::now().to_rfc3339(),
+                            };
+                            Err(error_entry)
+                        }
                     }
                 });
+
                 tasks.push(task);
             }
         }
@@ -848,7 +658,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create progress bar for log fetching
     let fetch_progress = {
-        let pb = ProgressBar::new(total_fetch_containers as u64); // Use actual count
+        let pb = ProgressBar::new(tasks.len() as u64);
         pb.set_style(
             ProgressStyle::default_bar()
                 .template(
@@ -934,31 +744,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(pb)
         };
 
-        let string_pool_filter_clone = Arc::clone(&string_pool); // Clone for filter closure
-        let filtered: Vec<(usize, LogMetadata)> = all_log_lines // Type is now Vec<(usize, LogMetadata)>
+        let filtered: Vec<(String, LogMetadata)> = all_log_lines
             .into_iter()
             .enumerate()
-            .filter_map(|(i, (line_id, metadata))| {
-                // line_id is usize (StringId)
+            .filter_map(|(i, (line, metadata))| {
                 if let Some(ref pb) = filter_progress {
                     if i % 100 == 0 {
+                        // Update every 100 items to avoid too frequent updates
                         pb.set_position(i as u64);
                     }
                 }
 
-                let line_to_filter = {
-                    let pool_guard = string_pool_filter_clone.lock();
-                    pool_guard.get_string(line_id).unwrap_or_default() // Get string from pool
-                };
-
-                let line_lower = line_to_filter.to_lowercase();
+                let line_lower = line.to_lowercase();
                 let matches = cli
                     .filter
                     .iter()
                     .any(|filter| line_lower.contains(&filter.to_lowercase()));
 
                 if matches {
-                    Some((line_id, metadata))
+                    Some((line, metadata))
                 } else {
                     None
                 }
@@ -987,13 +791,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let clusters = cluster_logs_parallel(
-        filtered_logs, // This is Vec<(usize, LogMetadata)> now
+        filtered_logs,
         cli.threshold,
         cli.json,
         cli.batch_size_factor,
         cli.no_word_filter,
-        cli.member_limit,
-        &string_pool, // Pass the initialized string_pool
+        cli.member_limit, // Pass member_limit here
     )
     .await;
 
@@ -1004,10 +807,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             errors: error_list,
             clusters,
         };
-        let json_output = serde_json::to_string_pretty(&output).map_err(|e| {
-            eprintln!("Failed to serialize output to JSON: {}", e);
-            Box::<dyn std::error::Error>::from(e)
-        })?;
+        let json_output = serde_json::to_string_pretty(&output)?;
         println!("{}", json_output);
     } else {
         println!("\n--- Log Clusters ---");
@@ -1024,19 +824,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    //     = help: `std::io::Error` implements `Error` so you could box the found value and coerce it to the trait object `Box<dyn Error>`, you will have to change the expected type as well
+
     Ok(())
 }
 
 // Parallel clustering using work-stealing with memory-mapped storage
 async fn cluster_logs_parallel(
-    logs: Vec<(usize, LogMetadata)>, // Changed to Vec<(usize, LogMetadata)> for StringId
+    logs: Vec<(String, LogMetadata)>,
     similarity_threshold: f64,
     json_mode: bool,
     batch_size_factor: usize,
     no_word_filter: bool,
-    member_limit: usize,
-    string_pool: &SharedStringPool, // Added parameter
+    member_limit: usize, // Added member_limit parameter
 ) -> Vec<LogCluster> {
     if logs.is_empty() {
         return Vec::new();
@@ -1049,42 +848,38 @@ async fn cluster_logs_parallel(
         );
     }
 
-    // Dynamically calculate MmapStringPool capacity - REMOVED, pool is pre-initialized and passed in
-    // let estimated_total_string_size_bytes: usize = logs.iter().map(|(line, _)| line.len()).sum();
+    // Dynamically calculate MmapStringPool capacity
+    let estimated_total_string_size_bytes: usize = logs.iter().map(|(line, _)| line.len()).sum();
     // Apply a multiplier (e.g., 2.5x) to account for normalized strings, words, and overhead.
     // Ensure a minimum capacity (e.g., 64MB) and a maximum (e.g., 2048MB).
-    // let calculated_capacity_mb =
-    //     ((estimated_total_string_size_bytes as f64 * 2.5) / (1024.0 * 1024.0)).ceil() as usize;
-    // let capacity_mb = calculated_capacity_mb.clamp(4, 2048);
+    let calculated_capacity_mb =
+        ((estimated_total_string_size_bytes as f64 * 2.5) / (1024.0 * 1024.0)).ceil() as usize;
+    let capacity_mb = calculated_capacity_mb.clamp(4, 2048);
 
-    // if !json_mode {
-    //     println!(
-    //         "Estimated total string data size (within cluster_logs_parallel): {:.2} MB", // This was based on input `logs`
-    //         estimated_total_string_size_bytes as f64 / (1024.0 * 1024.0)
-    //     );
-    //     println!(
-    //         "Calculated MmapStringPool capacity (within cluster_logs_parallel): {} MB (Min: 4MB, Max: 2048MB)",
-    //         capacity_mb
-    //     );
-    // }
+    if !json_mode {
+        println!(
+            "Estimated total string data size: {:.2} MB",
+            estimated_total_string_size_bytes as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "Calculated MmapStringPool capacity: {} MB (Min: 4MB, Max: 2048MB)",
+            capacity_mb
+        );
+    }
 
-    // Create memory-mapped string pool - REMOVED
-    // let string_pool = match MmapStringPool::new(capacity_mb) {
-    //     Ok(pool) => Arc::new(Mutex::new(pool)),
-    //     Err(e) => {
-    //         if !json_mode {
-    //             eprintln!(
-    //                 "Failed to create memory-mapped pool, falling back to regular clustering: {}",
-    //                 e
-    //             );
-    //         }
-    //         // When string_pool is passed, fallback might need different handling if pool creation failed earlier in main.
-    //         // For now, assuming string_pool is valid if this function is called.
-    //         // The fallback path here might need reconsideration if main fails to create the pool.
-    //         // However, main now returns an error if pool creation fails, so this path might not be hit.
-    //         return cluster_logs_fallback(logs, similarity_threshold, json_mode, no_word_filter);
-    //     }
-    // };
+    // Create memory-mapped string pool
+    let string_pool = match MmapStringPool::new(capacity_mb) {
+        Ok(pool) => Arc::new(Mutex::new(pool)),
+        Err(e) => {
+            if !json_mode {
+                eprintln!(
+                    "Failed to create memory-mapped pool, falling back to regular clustering: {}",
+                    e
+                );
+            }
+            return cluster_logs_fallback(logs, similarity_threshold, json_mode, no_word_filter);
+        }
+    };
 
     let start = Instant::now();
 
@@ -1101,10 +896,7 @@ async fn cluster_logs_parallel(
 
     let batches: Vec<Vec<WorkItem>> = logs
         .into_iter()
-        .map(|(log_line_id, metadata)| WorkItem {
-            log_line_id,
-            metadata,
-        }) // Use log_line_id
+        .map(|(log_line, metadata)| WorkItem { log_line, metadata })
         .collect::<Vec<_>>()
         .chunks(batch_size)
         .map(|chunk| chunk.to_vec())
@@ -1148,31 +940,28 @@ async fn cluster_logs_parallel(
     let mut worker_handles = Vec::new();
     for _ in 0..num_workers {
         let receiver = receiver.clone();
-        let string_pool_worker_clone = Arc::clone(string_pool); // Use the passed-in string_pool
-        let batch_progress_worker_clone = batch_progress.as_ref().map(Arc::clone); // Renamed for clarity
+        let string_pool = Arc::clone(&string_pool);
+        let batch_progress = batch_progress.as_ref().map(Arc::clone);
 
         let handle = task::spawn(async move {
             let mut normalizer = LogNormalizer::new_with_filter(no_word_filter);
             let mut worker_clusters: Vec<OptimizedLogCluster> = Vec::new();
-            let _batches_processed = 0;
+            let _batches_processed = 0; // Renamed to suppress warning
 
             while let Ok(batch) = receiver.recv() {
                 for work_item in batch {
-                    // TODO: If WorkItem changes to use StringId, process_log_item needs adjustment.
-                    // For now, WorkItem still has String. process_log_item will use string_pool_worker_clone.
                     process_log_item(
-                        work_item, // work_item.log_line is String
+                        work_item,
                         &mut worker_clusters,
                         &mut normalizer,
                         similarity_threshold,
-                        &string_pool_worker_clone, // Pass the pool here
+                        &string_pool,
                     )
                     .await;
                 }
 
                 // Update progress bar directly after each batch
-                if let Some(ref pb_mutex) = batch_progress_worker_clone {
-                    // Use the cloned progress bar
+                if let Some(ref pb_mutex) = batch_progress {
                     let pb = pb_mutex.lock();
                     pb.inc(1);
                 }
@@ -1205,8 +994,8 @@ async fn cluster_logs_parallel(
     let merged_clusters = merge_clusters(
         all_clusters,
         similarity_threshold,
-        string_pool, // Pass the pool here
-        None,
+        &string_pool,
+        None, // No progress bar for merging in human mode
     )
     .await;
     let merge_duration = merge_start.elapsed();
@@ -1219,7 +1008,7 @@ async fn cluster_logs_parallel(
     }
 
     // Convert optimized clusters back to regular clusters
-    let string_pool_guard = string_pool.lock(); // Use the passed-in pool
+    let string_pool_guard = string_pool.lock();
     let result_clusters: Vec<LogCluster> = merged_clusters
         .iter()
         .map(|opt_cluster| opt_cluster.to_log_cluster(&string_pool_guard, member_limit)) // Pass member_limit
@@ -1240,7 +1029,7 @@ async fn cluster_logs_parallel(
             "DEBUG_PERFORMANCE: Parallel clustering timing: clustering phase = {:?}, merging phase = {:?}, string pool lock count = {}",
             clustering_duration,
             merge_duration,
-            pool.lock_count.load(std::sync::atomic::Ordering::Relaxed) // Use passed-in pool
+            pool.lock_count.load(std::sync::atomic::Ordering::Relaxed)
         );
     }
 
@@ -1331,29 +1120,16 @@ async fn process_log_item(
     clusters: &mut Vec<OptimizedLogCluster>,
     normalizer: &mut LogNormalizer,
     similarity_threshold: f64,
-    string_pool: &SharedStringPool, // Keep this as we need to read from the pool
+    string_pool: &SharedStringPool,
 ) {
-    let log_line_id = work_item.log_line_id;
+    let log_line = work_item.log_line;
     let metadata = work_item.metadata;
-
-    // Retrieve the log line from the string pool
-    let log_line = {
-        let pool_guard = lock_and_count(string_pool); // Use existing lock_and_count helper
-        match pool_guard.get_string(log_line_id) {
-            Some(line) => line,
-            None => {
-                // eprintln!("Warning: Could not retrieve log line with ID {} from pool in process_log_item. Skipping.", log_line_id);
-                return; // Skip if string ID is invalid or not found
-            }
-        }
-    };
 
     if log_line.trim().is_empty() {
         return;
     }
 
-    // Extract words and normalized text without holding the lock on the main pool for this part
-    // Normalizer has its own cache, which is fine.
+    // Extract words and normalized text without holding the lock
     let (words, normalized_text) = normalizer.extract_words_and_normalized(&log_line);
 
     // Skip lines with no meaningful words
@@ -1389,15 +1165,14 @@ async fn process_log_item(
     if let Some(index) = best_match_index {
         // Only lock for the minimal time needed to add a member
         let mut string_pool_guard = lock_and_count(string_pool);
-        clusters[index].add_member(&log_line, metadata, &mut string_pool_guard); // Pass actual log_line string
+        clusters[index].add_member(&log_line, metadata, &mut string_pool_guard);
     } else {
         // Limit total clusters to prevent memory issues
         if clusters.len() < 50 {
-            // TODO: Make this configurable or dynamic
             // Only lock for the minimal time needed to create a new cluster
             let mut string_pool_guard = lock_and_count(string_pool);
             let new_cluster = OptimizedLogCluster::new(
-                &log_line, // Pass actual log_line string
+                &log_line,
                 words,
                 normalized_text,
                 metadata,
@@ -1406,4 +1181,133 @@ async fn process_log_item(
             clusters.push(new_cluster);
         }
     }
+}
+
+// Fallback clustering function (original implementation)
+fn cluster_logs_fallback(
+    logs: Vec<(String, LogMetadata)>,
+    similarity_threshold: f64,
+    json_mode: bool,
+    no_word_filter: bool,
+) -> Vec<LogCluster> {
+    let mut normalizer = LogNormalizer::new_with_filter(no_word_filter);
+    cluster_logs(logs, similarity_threshold, &mut normalizer, json_mode)
+}
+
+// Ultra-fast clustering using sorensen_dice similarity
+fn cluster_logs(
+    logs: Vec<(String, LogMetadata)>,
+    similarity_threshold: f64,
+    normalizer: &mut LogNormalizer,
+    json_mode: bool,
+) -> Vec<LogCluster> {
+    let mut clusters: Vec<LogCluster> = Vec::new();
+
+    if logs.is_empty() {
+        return clusters;
+    }
+
+    if !json_mode {
+        println!(
+            "Starting fast sorensen_dice-based clustering with {} log lines...",
+            logs.len()
+        );
+    }
+
+    // Create progress bar for fallback clustering
+    let clustering_progress = if !json_mode {
+        let pb = ProgressBar::new(logs.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+                )
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        pb.set_message("Clustering logs (fallback mode)...");
+        Some(pb)
+    } else {
+        None
+    };
+
+    let mut processed = 0;
+
+    for (log_line, metadata) in logs {
+        if log_line.trim().is_empty() {
+            continue;
+        }
+
+        processed += 1;
+        if !json_mode && processed % 500 == 0 {
+            println!(
+                "Processed {} lines, {} clusters so far",
+                processed,
+                clusters.len()
+            );
+        }
+
+        // Update progress bar
+        if let Some(ref pb) = clustering_progress {
+            if processed % 10 == 0 {
+                // Update every 10 items to avoid too frequent updates
+                pb.set_position(processed as u64);
+            }
+        }
+
+        let (words, normalized_text) = normalizer.extract_words_and_normalized(&log_line);
+
+        // Skip lines with no meaningful words
+        if words.is_empty() {
+            continue;
+        }
+
+        let mut best_match_index: Option<usize> = None;
+        let mut max_similarity = 0.0;
+
+        // Limit cluster checking for performance
+        let check_limit = if clusters.len() > 500 {
+            100
+        } else {
+            clusters.len()
+        };
+
+        for (i, _a) in clusters.iter().enumerate().take(check_limit) {
+            let similarity = clusters[i].similarity_to(&normalized_text);
+            if similarity > max_similarity {
+                max_similarity = similarity;
+                if similarity >= similarity_threshold {
+                    best_match_index = Some(i);
+                    break; // Early exit on good match
+                }
+            }
+        }
+
+        if let Some(index) = best_match_index {
+            clusters[index].add_member(log_line, metadata);
+        } else {
+            // Limit total clusters to prevent performance degradation
+            if clusters.len() < 1000 {
+                clusters.push(LogCluster::new(log_line, normalizer, metadata));
+            }
+        }
+    }
+
+    // Finish clustering progress bar
+    if let Some(pb) = clustering_progress {
+        pb.finish_with_message("Clustering complete!");
+    }
+
+    // Sort by count, descending
+    clusters.sort_by(|a, b| b.count.cmp(&a.count));
+
+    if !json_mode {
+        println!(
+            "Clustering complete! Created {} clusters from {} log lines",
+            clusters.len(),
+            processed
+        );
+    }
+
+    clusters
 }
