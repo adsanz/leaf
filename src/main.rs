@@ -838,7 +838,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(log_entries)
                         }
                         Err(e) => {
-                            return Err(ErrorEntry {
+                            Err(ErrorEntry {
                                 timestamp: Utc::now().to_rfc3339(),
                                 location: format!(
                                     "get_log_stream {}/{}",
@@ -846,7 +846,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     container_name_clone.clone()
                                 ),
                                 error: format!("Failed to get log stream: {}", e),
-                            });
+                            })
                         }
                     }
                 });
