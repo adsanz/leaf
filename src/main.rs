@@ -3,7 +3,7 @@ use ahash::{AHashMap, AHashSet};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use futures::stream::{self, StreamExt};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{ListParams, LogParams};
 use kube::{Api, Client};
@@ -16,6 +16,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use textdistance::str::sorensen_dice;
 use tokio::task;
+
+#[derive(Serialize, Debug)]
+struct ErrorEntry {
+    error: String,
+    location: String,
+    timestamp: String,
+}
 
 #[derive(Parser)]
 #[clap(
@@ -484,6 +491,12 @@ struct LogCluster {
     sources_set: AHashSet<(String, String, String)>, // O(1) source deduplication lookup
 }
 
+#[derive(Serialize)]
+struct JsonOutput {
+    clusters: Vec<LogCluster>,
+    errors: Vec<ErrorEntry>,
+}
+
 impl LogCluster {
     fn new(log_line: String, normalizer: &mut LogNormalizer, metadata: LogMetadata) -> Self {
         let (words, normalized_text) = normalizer.extract_words_and_normalized(&log_line);
@@ -562,6 +575,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut all_log_lines = Vec::new();
+    let mut error_list = Vec::new();
 
     // Create tasks for concurrent log fetching
     let mut tasks = Vec::new();
@@ -602,21 +616,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let log_entries: Vec<(String, LogMetadata)> = lines
                                 .into_iter()
                                 .map(|line| {
-                                    let metadata = LogMetadata {
-                                        namespace: namespace_clone.clone(),
-                                        pod: pod_name_clone.clone(),
-                                        container: container_name.clone(),
-                                    };
-                                    (line, metadata)
+                                    (
+                                        line,
+                                        LogMetadata {
+                                            namespace: namespace_clone.clone(),
+                                            pod: pod_name_clone.clone(),
+                                            container: container_name.clone(),
+                                        },
+                                    )
                                 })
                                 .collect();
 
                             Ok(log_entries)
                         }
                         Err(e) => {
-                            // Removed per-pod/container error eprintln! here
-                            // Only progress bar and final stats will be shown
-                            Err(e)
+                            let error_entry = ErrorEntry {
+                                error: e.to_string(),
+                                location: format!(
+                                    "pod: {}, container: {}",
+                                    pod_name_clone, container_name
+                                ),
+                                timestamp: Utc::now().to_rfc3339(),
+                            };
+                            Err(error_entry)
                         }
                     }
                 });
@@ -627,7 +649,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Create progress bar for log fetching
-    let fetch_progress = if !cli.json {
+    let fetch_progress = {
         let pb = ProgressBar::new(tasks.len() as u64);
         pb.set_style(
             ProgressStyle::default_bar()
@@ -638,9 +660,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .progress_chars("#>-"),
         );
         pb.set_message("Fetching logs from pods...");
+        if cli.json {
+            pb.set_draw_target(ProgressDrawTarget::stderr());
+        }
         Some(pb)
-    } else {
-        None
     };
 
     // Execute tasks with concurrency limit and update progress bar in real-time
@@ -654,13 +677,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(Ok(log_entries)) => {
                 all_log_lines.extend(log_entries);
             }
-            Ok(Err(_)) => {
-                // Error already logged in the task
+            Ok(Err(error_entry)) => {
+                error_list.push(error_entry);
             }
             Err(e) => {
                 if !cli.json {
                     eprintln!("Task error: {}", e);
                 }
+                error_list.push(ErrorEntry {
+                    error: e.to_string(),
+                    location: "Task execution".to_string(),
+                    timestamp: Utc::now().to_rfc3339(),
+                });
             }
         }
 
@@ -696,7 +724,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pb.set_message("Filtering logs...");
             Some(pb)
         } else {
-            None
+            let pb = ProgressBar::new(original_count as u64);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.yellow/blue}] {pos}/{len} {msg}")
+                    .unwrap()
+                    .progress_chars("#>-"),
+            );
+            pb.set_message("Filtering logs...");
+            pb.set_draw_target(ProgressDrawTarget::stderr());
+            Some(pb)
         };
 
         let filtered: Vec<(String, LogMetadata)> = all_log_lines
@@ -760,9 +797,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             clusters
                 .into_iter()
                 .map(|mut cluster| {
-                    if cluster.members.len() > cli.member_limit {
-                        cluster.members.truncate(cli.member_limit);
-                    }
+                    cluster.members.truncate(cli.member_limit);
                     cluster
                 })
                 .collect()
@@ -770,7 +805,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             clusters
         };
 
-        let json_output = serde_json::to_string_pretty(&limited_clusters)?;
+        let output = JsonOutput {
+            clusters: limited_clusters,
+            errors: error_list,
+        };
+        let json_output = serde_json::to_string_pretty(&output)?;
         println!("{}", json_output);
     } else {
         println!("\n--- Log Clusters ---");
@@ -810,8 +849,27 @@ async fn cluster_logs_parallel(
         );
     }
 
-    // Create memory-mapped string pool (64MB initial capacity, smaller footprint)
-    let string_pool = match MmapStringPool::new(64) {
+    // Dynamically calculate MmapStringPool capacity
+    let estimated_total_string_size_bytes: usize = logs.iter().map(|(line, _)| line.len()).sum();
+    // Apply a multiplier (e.g., 2.5x) to account for normalized strings, words, and overhead.
+    // Ensure a minimum capacity (e.g., 64MB) and a maximum (e.g., 2048MB).
+    let calculated_capacity_mb =
+        ((estimated_total_string_size_bytes as f64 * 2.5) / (1024.0 * 1024.0)).ceil() as usize;
+    let capacity_mb = calculated_capacity_mb.clamp(4, 2048);
+
+    if !json_mode {
+        println!(
+            "Estimated total string data size: {:.2} MB",
+            estimated_total_string_size_bytes as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "Calculated MmapStringPool capacity: {} MB (Min: 4MB, Max: 2048MB)",
+            capacity_mb
+        );
+    }
+
+    // Create memory-mapped string pool
+    let string_pool = match MmapStringPool::new(capacity_mb) {
         Ok(pool) => Arc::new(Mutex::new(pool)),
         Err(e) => {
             if !json_mode {
@@ -855,20 +913,21 @@ async fn cluster_logs_parallel(
     }
 
     // Create progress bar for batch processing
-    let batch_progress = if !json_mode {
+    let batch_progress = {
         let pb = ProgressBar::new(batches.len() as u64);
         pb.set_style(
             ProgressStyle::default_bar()
                 .template(
-                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.magenta/blue}] {pos}/{len} {msg}",
                 )
                 .unwrap()
                 .progress_chars("#>-"),
         );
-        pb.set_message("Processing batches in parallel...");
+        pb.set_message("Clustering batches...");
+        if json_mode {
+            pb.set_draw_target(ProgressDrawTarget::stderr());
+        }
         Some(Arc::new(Mutex::new(pb)))
-    } else {
-        None
     };
 
     // Use crossbeam_channel for work distribution
