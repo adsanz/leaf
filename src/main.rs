@@ -202,7 +202,7 @@ struct PackedLogMetadata {
 
 impl OptimizedLogCluster {
     fn new(
-        log_line: &str,
+        log_line: &str, // Added log_line parameter based on usage in original code
         words: Vec<String>,
         normalized_text: String,
         metadata: LogMetadata,
@@ -282,7 +282,7 @@ impl OptimizedLogCluster {
         }
     }
 
-    fn to_log_cluster(&self, string_pool: &MmapStringPool) -> LogCluster {
+    fn to_log_cluster(&self, string_pool: &MmapStringPool, member_limit: usize) -> LogCluster {
         let representative = string_pool
             .get_string(self.representative_id)
             .unwrap_or_default();
@@ -294,9 +294,17 @@ impl OptimizedLogCluster {
             .iter()
             .filter_map(|&id| string_pool.get_string(id))
             .collect();
+
+        let num_members_to_take = if member_limit == 0 {
+            self.member_ids.len() // Take all if limit is 0
+        } else {
+            member_limit.min(self.member_ids.len()) // Otherwise, take up to the limit, but not more than available
+        };
+
         let members: Vec<String> = self
             .member_ids
             .iter()
+            .take(num_members_to_take) // Apply the limit
             .filter_map(|&id| string_pool.get_string(id))
             .collect();
 
@@ -315,22 +323,22 @@ impl OptimizedLogCluster {
             })
             .collect();
 
-        // Build HashSets for performance
-        let members_set: AHashSet<String> = members.iter().cloned().collect();
-        let sources_set: AHashSet<(String, String, String)> = sources
-            .iter()
-            .map(|s| (s.namespace.clone(), s.pod.clone(), s.container.clone()))
-            .collect();
+        // OPTIMIZATION: These sets are not used after conversion from OptimizedLogCluster
+        // in the current workflow (JSON output or console printing).
+        // Initializing them as empty saves computation and memory, especially when
+        // member_limit is 0 and 'members'/'sources' vectors can be large.
+        let members_set = AHashSet::new();
+        let sources_set = AHashSet::new();
 
         LogCluster {
             representative,
             normalized_text,
             words,
-            members,
-            members_set,
-            count: self.count,
+            members,           // Members vector is now potentially smaller
+            members_set,       // Now an empty set
+            count: self.count, // Count still reflects the total number of original members
             sources,
-            sources_set,
+            sources_set, // Now an empty set
         }
     }
 }
@@ -788,26 +796,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.json,
         cli.batch_size_factor,
         cli.no_word_filter,
+        cli.member_limit, // Pass member_limit here
     )
     .await;
 
     if cli.json {
-        // Apply member limit if specified for JSON output
-        let limited_clusters: Vec<LogCluster> = if cli.member_limit > 0 {
-            clusters
-                .into_iter()
-                .map(|mut cluster| {
-                    cluster.members.truncate(cli.member_limit);
-                    cluster
-                })
-                .collect()
-        } else {
-            clusters
-        };
-
+        // The `clusters` vector now already respects `cli.member_limit`
+        // if cli.member_limit > 0, so direct truncation here is no longer needed.
         let output = JsonOutput {
-            clusters: limited_clusters,
             errors: error_list,
+            clusters,
         };
         let json_output = serde_json::to_string_pretty(&output)?;
         println!("{}", json_output);
@@ -837,6 +835,7 @@ async fn cluster_logs_parallel(
     json_mode: bool,
     batch_size_factor: usize,
     no_word_filter: bool,
+    member_limit: usize, // Added member_limit parameter
 ) -> Vec<LogCluster> {
     if logs.is_empty() {
         return Vec::new();
@@ -1012,7 +1011,7 @@ async fn cluster_logs_parallel(
     let string_pool_guard = string_pool.lock();
     let result_clusters: Vec<LogCluster> = merged_clusters
         .iter()
-        .map(|opt_cluster| opt_cluster.to_log_cluster(&string_pool_guard))
+        .map(|opt_cluster| opt_cluster.to_log_cluster(&string_pool_guard, member_limit)) // Pass member_limit
         .collect();
     drop(string_pool_guard);
 
