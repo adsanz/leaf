@@ -81,7 +81,7 @@ struct Cli {
         help = "Filter logs since a specific duration (e.g., '1h', '10m', '30s')"
     )]
     #[clap(value_parser = parse_duration_to_seconds)]
-    since: Option<String>,
+    since: Option<i64>,
     #[clap(
         short = 'f',
         long,
@@ -571,18 +571,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Found {} pods matching criteria", pod_list.items.len());
     }
 
-    let since_seconds: Option<i64> = match cli.since.as_ref() {
-        Some(s) => match parse_duration_to_seconds(s) {
-            Ok(seconds) => Some(seconds),
-            Err(e) => {
-                if !cli.json {
-                    eprintln!("Warning: Invalid --since value '{}': {}. Ignoring.", s, e);
-                }
-                None
-            }
-        },
-        None => None,
-    };
+    let since_seconds: Option<i64> = cli.since;
 
     // --- Pre-fetch Phase ---
     let prefetch_start_time = Instant::now();
@@ -608,10 +597,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let task = tokio::spawn(async move {
                     let logs_api: Api<Pod> = Api::namespaced(client_clone, &namespace_clone);
-                    let mut lp = LogParams::default();
-                    lp.container = Some(container_name_clone.clone());
-                    lp.timestamps = false; // No need for timestamps in pre-fetch
-                    lp.since_seconds = since_seconds_clone;
+                    let lp = LogParams {
+                        container: Some(container_name_clone.clone()),
+                        timestamps: false, // No need for timestamps in pre-fetch
+                        since_seconds: since_seconds_clone,
+                        ..Default::default()
+                    };
 
                     let mut line_count: usize = 0;
                     let mut byte_count: usize = 0;
@@ -787,10 +778,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let task = tokio::spawn(async move {
                     let logs_api: Api<Pod> = Api::namespaced(client_clone, &namespace_clone);
-                    let mut lp = LogParams::default();
-                    lp.container = Some(container_name_clone.clone());
-                    lp.timestamps = true;
-                    lp.since_seconds = since_seconds_clone;
+                    let lp = LogParams {
+                        container: Some(container_name_clone.clone()),
+                        timestamps: true,
+                        since_seconds: since_seconds_clone,
+                        ..Default::default()
+                    };
 
                     let mut log_entries: Vec<(usize, LogMetadata)> = Vec::new(); // For StringId
                     let metadata = LogMetadata {
@@ -837,17 +830,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             Ok(log_entries)
                         }
-                        Err(e) => {
-                            Err(ErrorEntry {
-                                timestamp: Utc::now().to_rfc3339(),
-                                location: format!(
-                                    "get_log_stream {}/{}",
-                                    pod_name_clone,
-                                    container_name_clone.clone()
-                                ),
-                                error: format!("Failed to get log stream: {}", e),
-                            })
-                        }
+                        Err(e) => Err(ErrorEntry {
+                            timestamp: Utc::now().to_rfc3339(),
+                            location: format!(
+                                "get_log_stream {}/{}",
+                                pod_name_clone,
+                                container_name_clone.clone()
+                            ),
+                            error: format!("Failed to get log stream: {}", e),
+                        }),
                     }
                 });
                 tasks.push(task);
