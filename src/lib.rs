@@ -11,6 +11,173 @@ use std::time::Instant;
 use textdistance::str::sorensen_dice;
 use tokio::task;
 
+// Bigram cache for optimized string similarity calculations
+#[derive(Debug)]
+pub struct BigramCache {
+    cache: AHashMap<String, Vec<String>>,
+    max_size: usize,
+}
+
+impl BigramCache {
+    pub fn new(max_size: usize) -> Self {
+        BigramCache {
+            cache: AHashMap::new(),
+            max_size,
+        }
+    }
+
+    pub fn get_bigrams(&mut self, text: &str) -> Vec<String> {
+        if let Some(bigrams) = self.cache.get(text) {
+            return bigrams.clone();
+        }
+
+        let bigrams = self.generate_bigrams(text);
+
+        if self.cache.len() >= self.max_size {
+            // Simple eviction: remove a quarter of the cache if full.
+            // A more sophisticated LRU or LFU policy could be used here.
+            let to_remove_count = self.max_size / 4;
+            let keys_to_remove: Vec<String> =
+                self.cache.keys().take(to_remove_count).cloned().collect();
+            for key in keys_to_remove {
+                self.cache.remove(&key);
+            }
+        }
+
+        self.cache.insert(text.to_string(), bigrams.clone());
+        bigrams
+    }
+
+    fn generate_bigrams(&self, text: &str) -> Vec<String> {
+        if text.len() < 2 {
+            // For single character strings or empty strings, consider the string itself as a "bigram"
+            // or return an empty vec. Returning the string itself might be more useful for similarity.
+            return vec![text.to_string()];
+        }
+        text.chars()
+            .collect::<Vec<char>>()
+            .windows(2)
+            .map(|window| window.iter().collect::<String>())
+            .collect()
+    }
+}
+
+// Simplified Optimized Similarity Calculator
+#[derive(Debug)]
+pub struct SimpleOptimizedSimilarityCalculator {
+    bigram_cache: BigramCache,
+    similarity_threshold: f64, // Store the threshold it was created with
+}
+
+impl SimpleOptimizedSimilarityCalculator {
+    pub fn new(similarity_threshold: f64, cache_size: usize) -> Self {
+        SimpleOptimizedSimilarityCalculator {
+            bigram_cache: BigramCache::new(cache_size),
+            similarity_threshold,
+        }
+    }
+
+    fn passes_char_frequency_check(&self, text1: &str, text2: &str) -> bool {
+        let mut chars1 = AHashMap::new();
+        let mut chars2 = AHashMap::new();
+
+        for ch in text1.chars() {
+            *chars1.entry(ch).or_insert(0) += 1;
+        }
+        for ch in text2.chars() {
+            *chars2.entry(ch).or_insert(0) += 1;
+        }
+
+        let mut common_chars = 0;
+        let total_chars1: usize = chars1.values().sum();
+        let total_chars2: usize = chars2.values().sum();
+
+        if total_chars1 == 0 && total_chars2 == 0 {
+            return true; // Both empty, considered similar in this context
+        }
+        if total_chars1 == 0 || total_chars2 == 0 {
+            return false; // One empty, one not
+        }
+
+        for (ch, &count1) in &chars1 {
+            if let Some(&count2) = chars2.get(ch) {
+                common_chars += count1.min(count2);
+            }
+        }
+        let char_similarity = (2.0 * common_chars as f64) / (total_chars1 + total_chars2) as f64;
+        // Use a slightly relaxed factor for the char frequency check compared to the main threshold
+        char_similarity >= (self.similarity_threshold * 0.75)
+    }
+
+    fn calculate_cached_sorensen_dice(&mut self, text1: &str, text2: &str) -> f64 {
+        let bigrams1 = self.bigram_cache.get_bigrams(text1);
+        let bigrams2 = self.bigram_cache.get_bigrams(text2);
+
+        if bigrams1.is_empty() && bigrams2.is_empty() {
+            return 1.0;
+        }
+        if bigrams1.is_empty() || bigrams2.is_empty() {
+            return 0.0;
+        }
+
+        let set1: AHashSet<&String> = bigrams1.iter().collect();
+        let set2: AHashSet<&String> = bigrams2.iter().collect();
+        let intersection_size = set1.intersection(&set2).count();
+
+        (2.0 * intersection_size as f64) / (bigrams1.len() + bigrams2.len()) as f64
+    }
+
+    pub fn calculate_similarity(&mut self, text1: &str, text2: &str) -> f64 {
+        // Early exit #1: Identical strings
+        if text1 == text2 {
+            return 1.0;
+        }
+
+        // Early exit #2: Empty strings
+        if text1.is_empty() && text2.is_empty() {
+            return 1.0; // Both empty
+        }
+        if text1.is_empty() || text2.is_empty() {
+            return 0.0; // One empty
+        }
+
+        // Early exit #3: Length difference too large
+        // (From performance.md: "Add quick rejection for obviously dissimilar strings based on length difference")
+        let len1 = text1.len();
+        let len2 = text2.len();
+        let min_len = len1.min(len2) as f64;
+        let max_len = len1.max(len2) as f64;
+
+        if max_len == 0.0 {
+            return 1.0;
+        } // Should be caught by empty string check, but good for safety
+        let len_ratio = min_len / max_len;
+
+        // If one string is more than 3x longer (ratio < 0.33), or if the length ratio implies
+        // that the Sorensen-Dice score cannot possibly meet the threshold.
+        // Max possible Sorensen-Dice is 2 * min_len / (min_len + max_len).
+        // If 2 * min_len / (min_len + max_len) < threshold, then they can\'t match.
+        // This simplifies to len_ratio < threshold / (2.0 - threshold)
+        if len_ratio < self.similarity_threshold / (2.0 - self.similarity_threshold) {
+            // A more aggressive check than just 0.33, tied to the threshold.
+            // For threshold 0.75, this is len_ratio < 0.75 / 1.25 = 0.6
+            // For threshold 0.5, this is len_ratio < 0.5 / 1.5 = 0.33
+            return 0.0;
+        }
+
+        // Early exit #4: Character frequency pre-filtering
+        // (From performance.md: "Implement character frequency pre-filtering")
+        // Only run this check for strings of a certain minimum length to avoid overhead on tiny strings.
+        const MIN_LEN_FOR_CHAR_FREQ_CHECK: usize = 15; // Adjusted from 20
+        if len1 > MIN_LEN_FOR_CHAR_FREQ_CHECK && len2 > MIN_LEN_FOR_CHAR_FREQ_CHECK && !self.passes_char_frequency_check(text1, text2) {
+            return 0.0;
+        }
+
+        // Full Sorensen-Dice calculation using cached bigrams
+        self.calculate_cached_sorensen_dice(text1, text2)
+    }
+}
+
 #[derive(Serialize, Debug)]
 pub struct ErrorEntry {
     pub error: String,
@@ -616,6 +783,10 @@ pub async fn cluster_logs_parallel(
         let handle = task::spawn(async move {
             let mut normalizer = LogNormalizer::new_with_filter(no_word_filter);
             let mut worker_clusters: Vec<OptimizedLogCluster> = Vec::new();
+            // Initialize the new similarity calculator for each worker
+            let mut similarity_calculator =
+                SimpleOptimizedSimilarityCalculator::new(similarity_threshold, 100); // Cache size 100 for workers
+
             let _batches_processed = 0; // Renamed to suppress warning
 
             while let Ok(batch) = receiver.recv() {
@@ -624,8 +795,9 @@ pub async fn cluster_logs_parallel(
                         work_item,
                         &mut worker_clusters,
                         &mut normalizer,
-                        similarity_threshold,
+                        similarity_threshold, // This threshold is now primarily for the calculator's internal logic if needed, or could be removed if calculator always uses its own
                         &string_pool,
+                        &mut similarity_calculator, // Pass the calculator
                     )
                     .await;
                 }
@@ -721,6 +893,9 @@ pub async fn merge_clusters(
     clusters.sort_by(|a, b| b.count.cmp(&a.count));
 
     let mut merged: Vec<OptimizedLogCluster> = Vec::new();
+    // Initialize the new similarity calculator for merging
+    let mut similarity_calculator =
+        SimpleOptimizedSimilarityCalculator::new(similarity_threshold, 100); // Cache size 100 for merging
 
     for (i, cluster) in clusters.into_iter().enumerate() {
         let mut found_merge = false;
@@ -732,20 +907,20 @@ pub async fn merge_clusters(
                 if let Some(merged_text) =
                     string_pool_guard.get_string(merged_cluster.normalized_text_id)
                 {
-                    let similarity = sorensen_dice_similarity(&cluster_text, &merged_text);
+                    // Use the new calculator
+                    let similarity =
+                        similarity_calculator.calculate_similarity(&cluster_text, &merged_text);
                     if similarity >= similarity_threshold {
-                        // Merge clusters with O(1) deduplication
-
-                        // Deduplicate member_ids using HashSet
-                        for &member_id in &cluster.member_ids {
-                            if !merged_cluster.member_ids_set.contains(&member_id) {
-                                merged_cluster.member_ids.push(member_id);
-                                merged_cluster.member_ids_set.insert(member_id);
+                        // Still check against the original threshold for merging decision
+                        // Merge cluster into merged_cluster
+                        for member_id in cluster.member_ids.iter() {
+                            if !merged_cluster.member_ids_set.contains(member_id) {
+                                merged_cluster.member_ids.push(*member_id);
+                                merged_cluster.member_ids_set.insert(*member_id);
                             }
                         }
 
-                        // Deduplicate sources using HashSet
-                        for source in &cluster.sources {
+                        for source in cluster.sources.iter() {
                             let source_key =
                                 (source.namespace_id, source.pod_id, source.container_id);
                             if !merged_cluster.sources_set.contains(&source_key) {
@@ -786,13 +961,14 @@ pub fn lock_and_count<'a>(
     guard
 }
 
-// Process a single log item with the shared string pool
+// Process a single log item with the shared string pool and optimized similarity calculator
 pub async fn process_log_item(
     work_item: WorkItem,
     clusters: &mut Vec<OptimizedLogCluster>,
     normalizer: &mut LogNormalizer,
-    similarity_threshold: f64,
+    similarity_threshold: f64, // This might become redundant if calculator manages its own threshold strictly
     string_pool: &SharedStringPool,
+    similarity_calculator: &mut SimpleOptimizedSimilarityCalculator, // Added calculator
 ) {
     let log_line = work_item.log_line;
     let metadata = work_item.metadata;
@@ -823,21 +999,25 @@ pub async fn process_log_item(
     {
         let string_pool_guard = lock_and_count(string_pool);
         for (i, cluster) in clusters.iter().enumerate().take(check_limit) {
-            let similarity = cluster.similarity_to(&normalized_text, &string_pool_guard);
-            if similarity > max_similarity {
-                max_similarity = similarity;
-                if similarity >= similarity_threshold {
+            if let Some(cluster_text) = string_pool_guard.get_string(cluster.normalized_text_id) {
+                // Use the new calculator
+                let similarity =
+                    similarity_calculator.calculate_similarity(&normalized_text, &cluster_text);
+                if similarity > max_similarity {
+                    max_similarity = similarity;
                     best_match_index = Some(i);
-                    break; // Early exit on good match
                 }
             }
         }
     }
 
     if let Some(index) = best_match_index {
-        // Only lock for the minimal time needed to add a member
-        let mut string_pool_guard = lock_and_count(string_pool);
-        clusters[index].add_member(&log_line, metadata, &mut string_pool_guard);
+        if max_similarity >= similarity_threshold {
+            // Check against the original threshold for adding to cluster
+            // Only lock for the minimal time needed to add a member
+            let mut string_pool_guard = lock_and_count(string_pool);
+            clusters[index].add_member(&log_line, metadata, &mut string_pool_guard);
+        }
     } else {
         // Limit total clusters to prevent memory issues
         if clusters.len() < 50 {
