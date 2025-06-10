@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc}; // Added ChronoDuration alias
 use clap::Parser;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -106,6 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let pod_name_clone = pod_name.clone();
                 let namespace_clone = namespace.clone();
                 let since = cli.since.clone();
+                let is_json_output = cli.json; // Capture json flag
 
                 let task = task::spawn(async move {
                     // Create namespace-specific client for log fetching
@@ -118,8 +119,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
 
                     if let Some(ref since_str) = since {
-                        if let Ok(since_time) = DateTime::parse_from_rfc3339(since_str) {
-                            log_params.since_time = Some(since_time.with_timezone(&Utc));
+                        // Use humantime to parse the duration
+                        if let Ok(duration) = humantime::parse_duration(since_str) {
+                            // Convert std::time::Duration to chrono::Duration
+                            match ChronoDuration::from_std(duration) {
+                                Ok(chrono_duration) => {
+                                    let since_time = Utc::now() - chrono_duration;
+                                    log_params.since_time = Some(since_time);
+                                }
+                                Err(_) => {
+                                    if !is_json_output {
+                                        // Use captured value
+                                        eprintln!(
+                                            "Error: Could not convert duration for --since value: {}",
+                                            since_str
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            // Fallback to RFC3339 parsing if humantime fails
+                            if let Ok(since_time) = DateTime::parse_from_rfc3339(since_str) {
+                                log_params.since_time = Some(since_time.with_timezone(&Utc));
+                            } else if !is_json_output {
+                                // Use captured value
+                                eprintln!(
+                                    "Error: Invalid format for --since value: {}. Please use a human-readable duration (e.g., '1h', '2d') or an RFC3339 timestamp.",
+                                    since_str
+                                );
+                            }
                         }
                     }
 
