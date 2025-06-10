@@ -7,8 +7,6 @@
 [![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Kubernetes](https://img.shields.io/badge/kubernetes-%23326ce5.svg?style=for-the-badge&logo=kubernetes&logoColor=white)](https://kubernetes.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
-![Performance](https://img.shields.io/badge/Performance-Optimized-green?style=for-the-badge)
-![Memory](https://img.shields.io/badge/Memory-Efficient-blue?style=for-the-badge)
 
 </div>
 
@@ -395,204 +393,45 @@ let check_limit = if clusters.len() > 500 {
 
 #### **⚠️ Performance Limitations (Be Aware)**
 
-**Clustering Algorithm Complexity:**
-```rust
-// Reality: O(n*m*k) where n=logs, m=clusters, k=avg_words
-// The code limits cluster checking to 100 when >500 clusters exist
-// This is a performance hack, not algorithmic optimization
-let check_limit = if clusters.len() > 500 { 100 } else { clusters.len() };
-```
-
-**Hard-coded Limits:**
-- **Max clusters checked**: 100 (when >500 clusters exist)
-- **Max total clusters**: 1000 (further clustering is skipped)
-- **Max cluster size**: 50 in parallel mode (prevents memory bloat)
-
-#### **📊 Tested Performance Benchmarks**
-
-<div align="center">
-
-| **Dataset Size** | **Tested Time** | **Memory Usage** | **Notes** |
-|:---------------:|:---------------:|:----------------:|:----------|
-| 1k-10k lines | 5-30 seconds | 50-100MB | Excellent clustering quality |
-| 10k-100k lines | 30s-5 minutes | 100-400MB | Good performance & quality |
-| 100k-500k lines | 2-10 minutes | 200-600MB | Performance optimizations active |
-| **1M lines** | **< 2 minutes** | **~600MB** | **With default settings** |
-
-*Performance varies by log complexity, length, and hardware specs*
-
-</div>
-
 #### **🚨 Known Limitations & Optimizations**
 
-1. **Adaptive Cluster Checking**: Limits similarity checks to 100 when >500 clusters exist  
-2. **Maximum Cluster Cap**: Stops creating new clusters after 1000 (prevents memory bloat)
-3. **Memory Pool Design**: 64MB string pool optimized for deduplication
-4. **Batch Processing**: Sequential similarity checking within batches, parallel across batches
+1.  **Adaptive Cluster Checking & Creation Logic:**
+    *   **Parallel Mode (Default):** To manage performance, each worker limits its search for similar clusters to a small subset of its locally held clusters (e.g., 25 if it holds >25). If no match is found, a new cluster is created by the worker only if its local cluster count is below a threshold (e.g., 50). This strategy optimizes per-worker processing and memory before global merging.
+    *   **Sequential Fallback Mode:** Employs a simpler limit, checking a new log line against a maximum of 100 existing clusters if the total cluster count has exceeded 500.
+2.  **Maximum Cluster Cap (Sequential Fallback Mode Only):** In the sequential fallback mode, the system enforces a cap of 1000 total clusters, preventing further new cluster creation beyond this. The primary parallel mode does not have a similar hard-coded global cap on the total number of clusters after results from workers are merged.
 
-#### **🎛️ Performance Tuning Guide**
+**Clustering Algorithm Complexity:**
+The clustering performance is influenced by internal check limits which vary by mode:
 
-**For Small Datasets (1k-50k lines):**
-```bash
-# Default settings work excellently
-leaf --threshold 0.9
-```
+*   **Parallel Mode (Default - `cluster_logs_parallel` using `process_log_item`):**
+    Each worker applies an aggressive check limit for new log lines against its local batch of clusters.
+    ```rust
+    // In parallel processing workers (process_log_item):
+    // Limits checking against existing clusters within a worker's batch.
+    // If a worker is managing more than 25 clusters, it only checks the new log
+    // against a subset (e.g., the first 25) of those clusters.
+    let check_limit = if clusters.len() > 25 { 25 } else { clusters.len() };
+    ```
 
-**For Large Datasets (50k-500k lines):**
-```bash
-# Optimize for throughput
-leaf --threshold 0.8 --batch-size-factor 6 --fetch-limit 15
-```
+*   **Sequential Fallback Mode (`cluster_logs`):**
+    This mode, used if parallel processing fails to initialize, has a different limit:
+    ```rust
+    // In fallback sequential clustering (cluster_logs):
+    // Reality: O(n*m*k) where n=logs, m=clusters, k=avg_words
+    // The code limits cluster checking to 100 when >500 clusters exist.
+    // This is a performance hack, not algorithmic optimization.
+    let check_limit = if clusters.len() > 500 { 100 } else { clusters.len() };
+    ```
 
-**For Very Large Datasets (500k-1M+ lines):**
-```bash
-# Maximum performance mode
-leaf --threshold 0.75 --batch-size-factor 8 --fetch-limit 20
-```
+**Hard-coded Internal Limits:**
+The system has different internal limits to manage performance and memory, depending on the clustering mode:
 
-**Memory-Constrained Environments:**
-```bash
-# Reduce concurrency and batch sizes
-leaf --fetch-limit 5 --batch-size-factor 2 --member-limit 20
-```
+*   **Parallel Mode (Default - `cluster_logs_parallel` using `process_log_item`):**
+    *   **Cluster Check Limit (per worker, per log line):** When a worker processes a log line, it checks against a maximum of 25 of its currently held clusters if that worker holds more than 25 clusters.
+    *   **New Cluster Creation Threshold (per worker):** If no suitable existing cluster is found by a worker (after checking up to 25 of its clusters), a new cluster is formed by that worker only if its current count of active clusters is less than 50. This helps manage memory and complexity at the worker level before results are merged.
+    *   **Overall Cluster Count:** There is no explicit hard-coded maximum for the total number of clusters after merging results from all parallel workers. The final number of clusters depends on the data, similarity threshold, and the merging logic.
+    *   **Cluster Member Output Limit:** The `--member-limit` CLI option (default: 0, for unlimited) restricts how many log lines are included *per cluster in the final JSON output*. This is an output formatting control, not an internal processing cap on how many logs can belong to a cluster during analysis.
 
-### ⚖️ **Trade-offs & Design Decisions**
-
-| **Aspect** | **Strength** | **Design Trade-off** |
-|:----------:|:-------------|:---------------------|
-| **Memory** | Efficient string deduplication | 64MB pool optimized for most use cases |
-| **Speed** | Sub-2min for 1M logs | Performance optimizations kick in at scale |
-| **Accuracy** | Excellent clustering quality | Smart limits prevent memory explosion |
-| **Parallelism** | True parallel log fetching | Clustering optimized per-batch for cache efficiency |
-
----
-
-## ❓ FAQ
-
-<details>
-<summary><strong>🤔 What is nonsense-word filtering and why is it important?</strong></summary>
-
-Nonsense-word filtering automatically removes tokens that don't contribute to meaningful clustering:
-- **UUIDs**: `550e8400-e29b-41d4-a716-446655440000`
-- **Hashes**: `sha256:a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3`
-- **Random tokens**: `xKj9mQ2pL8wR`, `q7w8e9r0t1y2`
-- **Single characters**: `a`, `1`, `@`, `#`
-
-**Current filter criteria**: Words ≥12 characters with ≥85% unique characters
-
-**Impact**: Significantly improves cluster quality by removing noise tokens.
-
-**Control**: Use `--no-word-filter` to disable (useful for debugging).
-</details>
-
-<details>
-<summary><strong>⚡ How does performance scale with log volume?</strong></summary>
-
-**Performance Scaling (Based on Real Testing):**
-
-| **Log Lines** | **Time Estimate** | **Memory** | **Clustering Quality** |
-|:-------------:|:----------------:|:----------:|:----------------------:|
-| 1k-5k | 5-15 seconds | 50-100MB | Excellent (full accuracy) |
-| 5k-50k | 15s-2 minutes | 100-300MB | Very good |
-| 50k-500k | 2-10 minutes | 300-600MB | Good (optimizations active) |
-| 500k-1M+ | **<2 minutes** | 400-800MB | Good (batch processing) |
-| 1M+ | **2-5 minutes** | 800MB+ | Acceptable (hard limits applied) |
-
-**Why it scales well:**
-- Efficient Rust implementation with memory pooling
-- Smart batching with `--batch-size-factor` tuning
-- Pattern-based filtering reduces noise early
-- Streaming processing for large datasets
-
-**Performance optimizations:**
-- Code limits detailed checking to first 100 clusters when >500 exist
-- Maximum of 1000 total clusters prevents memory explosion
-- Concurrent pod fetching with `--fetch-limit` control
-
-**Best use cases**: Handles production log volumes effectively (tested up to 1M+ lines).
-</details>
-
-<details>
-<summary><strong>📊 What similarity threshold should I use?</strong></summary>
-
-| **Threshold** | **Use Case** | **Performance Impact** | **Result Quality** |
-|:-------------:|:-------------|:----------------------:|:------------------:|
-| **0.95-1.0** | Exact matching | Fastest (early termination) | Many small clusters |
-| **0.85-0.94** | **Recommended** | Good balance | Balanced clustering |
-| **0.7-0.84** | Loose grouping | Slower (more comparisons) | Broader clusters |
-| **<0.7** | Very loose | Slowest | Risk of over-clustering |
-
-**Default**: 0.9 provides good balance for most Kubernetes log patterns.
-</details>
-
-<details>
-<summary><strong>🔧 Which output format should I choose?</strong></summary>
-
-**Human Format** (default):
-- Clean, readable output with statistics
-- Progress bars and performance diagnostics
-- Shows actual performance metrics and bottlenecks
-- Best for interactive analysis
-
-**JSON Format** (`--json`):
-- Structured data for automation
-- Use `--member-limit` to control output size
-- No progress indicators or debug info
-- Perfect for scripting and further processing
-</details>
-
-<details>
-<summary><strong>🚀 Is this truly "enterprise-scale"?</strong></summary>
-
-**Honest Assessment:**
-
-**✅ Good for:**
-- Development and staging environments
-- Troubleshooting specific issues (10k-20k logs)
-- Quick pattern identification
-- Medium-scale Kubernetes clusters
-
-**⚠️ Limitations for true enterprise scale:**
-- Hard-coded limits (1000 max clusters, 100 max checks)
-- O(n*m) clustering complexity doesn't scale linearly
-- 64MB memory pool can be limiting
-- Performance degrades significantly >50k logs
-
-**Better enterprise alternatives for massive scale:**
-- Use `--filter` to reduce log volume first
-- Process logs in smaller time windows
-- Consider dedicated log analysis platforms for >100k logs
-
-**Leaf's sweet spot**: 1k-20k log lines for optimal performance and accuracy.
-</details>
-
-<details>
-<summary><strong>🔍 How accurate is the Sorensen-Dice clustering?</strong></summary>
-
-**Algorithm**: `Similarity = 2 × |A ∩ B| / (|A| + |B|)`
-
-**Example**:
-```
-Log A: "error failed to connect to database"
-Log B: "error timeout connecting to database"
-
-Words A: {error, failed, connect, database}     (4 words)
-Words B: {error, timeout, connecting, database} (4 words)
-Common:  {error, database}                      (2 words)
-
-Similarity = 2 × 2 / (4 + 4) = 4/8 = 0.5
-```
-
-**Accuracy factors:**
-- **Word filtering quality**: Removes noise but may remove valid words
-- **Threshold setting**: Higher = more precise but more clusters
-- **Log volume**: Accuracy decreases with artificial limits at scale
-
-**Best accuracy**: Datasets under 20k logs with threshold 0.85-0.95
-</details>
-
----
-
-## 📄 License
-
-MIT
+*   **Sequential Fallback Mode (`cluster_logs`):**
+    *   **Cluster Check Limit:** Checks against a maximum of 100 existing clusters if the total number of clusters currently exceeds 500.
+    *   **Max Total Clusters:** Stops creating new clusters if 1000 clusters have already been formed in this mode.
