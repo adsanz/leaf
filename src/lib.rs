@@ -1,10 +1,8 @@
 // Kubernetes log clustering with sorensen_dice similarity
 use ahash::{AHashMap, AHashSet};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-use memmap2::{MmapMut, MmapOptions};
 use parking_lot::Mutex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer}; // Added Deserializer, Serializer
-use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -211,9 +209,7 @@ pub struct ErrorEntry {
 // Memory-mapped string pool for efficient string storage
 #[derive(Debug)]
 pub struct MmapStringPool {
-    #[allow(dead_code)] // Keeps the file alive for the memory mapping
-    file: std::fs::File,
-    mmap: Option<MmapMut>,
+    buffer: Vec<u8>, // Safe byte buffer instead of memory mapping
     string_to_id: AHashMap<String, usize>,
     id_to_offset: Vec<(usize, usize)>, // (offset, length) pairs
     current_offset: usize,
@@ -225,18 +221,12 @@ pub struct MmapStringPool {
 impl MmapStringPool {
     pub fn new(capacity_mb: usize) -> std::io::Result<Self> {
         let capacity = capacity_mb * 1024 * 1024; // Convert MB to bytes
-        let temp_file = tempfile::NamedTempFile::new()?;
-        let mut file = temp_file.into_file();
 
-        // Pre-allocate file space
-        file.set_len(capacity as u64)?;
-        file.seek(SeekFrom::Start(0))?;
-
-        let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
+        // Pre-allocate buffer with the required capacity and initialize with zeros
+        let buffer = vec![0; capacity];
 
         Ok(MmapStringPool {
-            file,
-            mmap: Some(mmap),
+            buffer,
             string_to_id: AHashMap::new(),
             id_to_offset: Vec::new(),
             current_offset: 0,
@@ -258,29 +248,25 @@ impl MmapStringPool {
             return usize::MAX;
         }
 
-        if let Some(ref mut mmap) = self.mmap {
-            // Write length prefix (little-endian u32)
-            let len_bytes = (string_bytes.len() as u32).to_le_bytes();
-            mmap[self.current_offset..self.current_offset + 4].copy_from_slice(&len_bytes);
+        // Write length prefix (little-endian u32)
+        let len_bytes = (string_bytes.len() as u32).to_le_bytes();
+        self.buffer[self.current_offset..self.current_offset + 4].copy_from_slice(&len_bytes);
 
-            // Write string data
-            let string_start = self.current_offset + 4;
-            mmap[string_start..string_start + string_bytes.len()].copy_from_slice(string_bytes);
+        // Write string data
+        let string_start = self.current_offset + 4;
+        self.buffer[string_start..string_start + string_bytes.len()].copy_from_slice(string_bytes);
 
-            let id = self.id_to_offset.len();
-            self.id_to_offset.push((self.current_offset, needed_space));
+        let id = self.id_to_offset.len();
+        self.id_to_offset.push((self.current_offset, needed_space));
 
-            // Only intern short strings (e.g., <256 bytes) to reduce memory usage
-            if s.len() < 256 {
-                self.string_to_id.insert(s.to_string(), id);
-            }
-
-            self.current_offset += needed_space;
-
-            id
-        } else {
-            usize::MAX
+        // Only intern short strings (e.g., <256 bytes) to reduce memory usage
+        if s.len() < 256 {
+            self.string_to_id.insert(s.to_string(), id);
         }
+
+        self.current_offset += needed_space;
+
+        id
     }
 
     pub fn get_string(&self, id: usize) -> Option<String> {
@@ -289,19 +275,16 @@ impl MmapStringPool {
         }
 
         let (offset, _size) = self.id_to_offset[id];
-        if let Some(ref mmap) = self.mmap {
-            // Read length prefix
-            let len_bytes = &mmap[offset..offset + 4];
-            let string_len =
-                u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]])
-                    as usize;
+        // Read length prefix
+        let len_bytes = &self.buffer[offset..offset + 4];
+        let string_len =
+            u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
 
-            // Read string data
-            let string_start = offset + 4;
-            if string_start + string_len <= mmap.len() {
-                let string_bytes = &mmap[string_start..string_start + string_len];
-                return String::from_utf8(string_bytes.to_vec()).ok();
-            }
+        // Read string data
+        let string_start = offset + 4;
+        if string_start + string_len <= self.buffer.len() {
+            let string_bytes = &self.buffer[string_start..string_start + string_len];
+            return String::from_utf8(string_bytes.to_vec()).ok();
         }
         None
     }
