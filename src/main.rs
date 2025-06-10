@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use futures::stream::{self, StreamExt};
@@ -131,9 +133,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     (
                                         line,
                                         LogMetadata {
-                                            namespace: namespace_clone.clone(),
-                                            pod: pod_name_clone.clone(),
-                                            container: container_name.clone(),
+                                            namespace: Arc::new(namespace_clone.clone()),
+                                            pod: Arc::new(pod_name_clone.clone()),
+                                            container: Arc::new(container_name.clone()),
                                         },
                                     )
                                 })

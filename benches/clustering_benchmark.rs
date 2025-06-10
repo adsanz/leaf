@@ -5,6 +5,7 @@ use leaf::{LogMetadata, cluster_logs_parallel};
 use rand::Rng;
 use rand::prelude::*;
 use rand::rngs::StdRng;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 
@@ -222,13 +223,13 @@ fn generate_realistic_logs(num_logs: usize, seed: u64) -> Vec<(String, LogMetada
             .replace("{ttl}", &format!("{}", rng.random_range(300..=3600)));
 
         let metadata = LogMetadata {
-            namespace: namespaces[rng.random_range(0..namespaces.len())].to_string(),
-            pod: format!(
+            namespace: Arc::new(namespaces[rng.random_range(0..namespaces.len())].to_string()),
+            pod: Arc::new(format!(
                 "{}-{}",
                 services[rng.random_range(0..services.len())],
-                rng.random_range(1..=3)
-            ),
-            container: services[rng.random_range(0..services.len())].to_string(),
+                rng.random_range(1..=10)
+            )),
+            container: Arc::new(services[rng.random_range(0..services.len())].to_string()),
         };
 
         logs.push((log_line, metadata));
@@ -717,13 +718,13 @@ fn generate_high_diversity_logs(num_logs: usize, seed: u64) -> Vec<(String, LogM
         );
 
         let metadata = LogMetadata {
-            namespace: namespaces[rng.random_range(0..namespaces.len())].to_string(),
-            pod: format!(
+            namespace: Arc::new(namespaces[rng.random_range(0..namespaces.len())].to_string()),
+            pod: Arc::new(format!(
                 "{}-{}",
                 services[rng.random_range(0..services.len())],
-                rng.random_range(1..100)
-            ),
-            container: services[rng.random_range(0..services.len())].to_string(),
+                rng.random_range(1..=10)
+            )),
+            container: Arc::new(services[rng.random_range(0..services.len())].to_string()),
         };
 
         logs.push((log_line, metadata));
@@ -754,9 +755,13 @@ fn generate_low_diversity_logs(num_logs: usize, seed: u64) -> Vec<(String, LogMe
         let log_line = format!("{} at {}", pattern, chrono::Utc::now().format("%H:%M:%S"));
 
         let metadata = LogMetadata {
-            namespace: namespaces[rng.random_range(0..namespaces.len())].to_string(),
-            pod: format!("{}-1", services[rng.random_range(0..services.len())]),
-            container: services[rng.random_range(0..services.len())].to_string(),
+            namespace: Arc::new(namespaces[rng.random_range(0..namespaces.len())].to_string()),
+            pod: Arc::new(format!(
+                "{}-{}",
+                services[rng.random_range(0..services.len())],
+                rng.random_range(1..=10)
+            )),
+            container: Arc::new(services[rng.random_range(0..services.len())].to_string()),
         };
 
         logs.push((log_line, metadata));
@@ -822,9 +827,13 @@ fn generate_variable_length_logs(
         }
 
         let metadata = LogMetadata {
-            namespace: namespaces[rng.random_range(0..namespaces.len())].to_string(),
-            pod: format!("{}-{}", service, rng.random_range(1..5)),
-            container: service.to_string(),
+            namespace: Arc::new(namespaces[rng.random_range(0..namespaces.len())].to_string()),
+            pod: Arc::new(format!(
+                "{}-{}",
+                services[rng.random_range(0..services.len())],
+                rng.random_range(1..=10)
+            )),
+            container: Arc::new(services[rng.random_range(0..services.len())].to_string()),
         };
 
         logs.push((log_line, metadata));

@@ -3,13 +3,33 @@ use ahash::{AHashMap, AHashSet};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use memmap2::{MmapMut, MmapOptions};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer}; // Added Deserializer, Serializer
 use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use textdistance::str::sorensen_dice;
 use tokio::task;
+
+// Helper module for Arc<String> serialization/deserialization
+mod arc_string_serde {
+    use super::*;
+    use std::sync::Arc;
+
+    pub fn serialize<S>(arc_str: &Arc<String>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(arc_str.as_str())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Arc<String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Arc::new)
+    }
+}
 
 // Bigram cache for optimized string similarity calculations
 #[derive(Debug)]
@@ -169,7 +189,10 @@ impl SimpleOptimizedSimilarityCalculator {
         // (From performance.md: "Implement character frequency pre-filtering")
         // Only run this check for strings of a certain minimum length to avoid overhead on tiny strings.
         const MIN_LEN_FOR_CHAR_FREQ_CHECK: usize = 15; // Adjusted from 20
-        if len1 > MIN_LEN_FOR_CHAR_FREQ_CHECK && len2 > MIN_LEN_FOR_CHAR_FREQ_CHECK && !self.passes_char_frequency_check(text1, text2) {
+        if len1 > MIN_LEN_FOR_CHAR_FREQ_CHECK
+            && len2 > MIN_LEN_FOR_CHAR_FREQ_CHECK
+            && !self.passes_char_frequency_check(text1, text2)
+        {
             return 0.0;
         }
 
@@ -324,9 +347,9 @@ impl OptimizedLogCluster {
         member_ids_set.insert(representative_id);
 
         let packed_metadata = PackedLogMetadata {
-            namespace_id: string_pool.intern_string(&metadata.namespace),
-            pod_id: string_pool.intern_string(&metadata.pod),
-            container_id: string_pool.intern_string(&metadata.container),
+            namespace_id: string_pool.intern_string(&metadata.namespace), // Dereference Arc
+            pod_id: string_pool.intern_string(&metadata.pod),             // Dereference Arc
+            container_id: string_pool.intern_string(&metadata.container), // Dereference Arc
         };
 
         let mut sources_set = AHashSet::new();
@@ -364,9 +387,9 @@ impl OptimizedLogCluster {
         }
 
         let packed_metadata = PackedLogMetadata {
-            namespace_id: string_pool.intern_string(&metadata.namespace),
-            pod_id: string_pool.intern_string(&metadata.pod),
-            container_id: string_pool.intern_string(&metadata.container),
+            namespace_id: string_pool.intern_string(&metadata.namespace), // Dereference Arc
+            pod_id: string_pool.intern_string(&metadata.pod),             // Dereference Arc
+            container_id: string_pool.intern_string(&metadata.container), // Dereference Arc
         };
 
         let source_key = (
@@ -420,9 +443,9 @@ impl OptimizedLogCluster {
             .sources
             .iter()
             .filter_map(|packed| {
-                let namespace = string_pool.get_string(packed.namespace_id)?;
-                let pod = string_pool.get_string(packed.pod_id)?;
-                let container = string_pool.get_string(packed.container_id)?;
+                let namespace = string_pool.get_string(packed.namespace_id).map(Arc::new)?; // Wrap in Arc
+                let pod = string_pool.get_string(packed.pod_id).map(Arc::new)?; // Wrap in Arc
+                let container = string_pool.get_string(packed.container_id).map(Arc::new)?; // Wrap in Arc
                 Some(LogMetadata {
                     namespace,
                     pod,
@@ -436,7 +459,10 @@ impl OptimizedLogCluster {
         // Initializing them as empty saves computation and memory, especially when
         // member_limit is 0 and 'members'/'sources' vectors can be large.
         let members_set = AHashSet::new();
-        let sources_set = AHashSet::new();
+        // This sources_set is for the final LogCluster, which will be constructed with Arcs.
+        // The original LogCluster::new and add_member methods will correctly populate this if needed.
+        // For now, it's initialized empty as per the optimization comment.
+        let sources_set: AHashSet<(Arc<String>, Arc<String>, Arc<String>)> = AHashSet::new();
 
         LogCluster {
             representative,
@@ -446,7 +472,7 @@ impl OptimizedLogCluster {
             members_set,       // Now an empty set
             count: self.count, // Count still reflects the total number of original members
             sources,
-            sources_set, // Now an empty set
+            sources_set, // Now an empty set, correctly typed
         }
     }
 }
@@ -585,11 +611,14 @@ pub fn sorensen_dice_similarity(text1: &str, text2: &str) -> f64 {
 }
 
 // Metadata for tracking log source
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)] // Added PartialEq, Eq, Hash
 pub struct LogMetadata {
-    pub namespace: String,
-    pub pod: String,
-    pub container: String,
+    #[serde(with = "arc_string_serde")]
+    pub namespace: Arc<String>,
+    #[serde(with = "arc_string_serde")]
+    pub pod: Arc<String>,
+    #[serde(with = "arc_string_serde")]
+    pub container: Arc<String>,
 }
 
 // Simplified LogCluster with sorensen_dice-based clustering
@@ -602,9 +631,9 @@ pub struct LogCluster {
     #[serde(skip)] // Skip serialization for performance sets
     pub members_set: AHashSet<String>, // O(1) deduplication lookup
     pub count: usize,
-    pub sources: Vec<LogMetadata>,
+    pub sources: Vec<LogMetadata>, // This now contains LogMetadata with Arc<String>
     #[serde(skip)] // Skip serialization for performance sets
-    pub sources_set: AHashSet<(String, String, String)>, // O(1) source deduplication lookup
+    pub sources_set: AHashSet<(Arc<String>, Arc<String>, Arc<String>)>, // O(1) source deduplication lookup, type updated
 }
 
 #[derive(Serialize)]
