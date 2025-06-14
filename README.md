@@ -41,9 +41,8 @@
 - [📖 Usage](#-usage)
 - [⚙️ CLI Options](#️-cli-options)
 - [💡 Examples](#-examples)
-- [🏗️ How It Works (Architecture)](#️-how-it-works-architecture)
-- [⚡ Performance & Scalability](#-performance--scalability)
-- [🧪 Running Benchmarks](#-running-benchmarks)
+- [🏗️ How It Works](#️-how-it-works)
+- [⚡ Performance & Benchmarks](#-performance--benchmarks)
 - [❓ FAQ](#-faq)
 - [📄 License](#-license)
 
@@ -132,7 +131,7 @@ graph LR
 |:-------|:------------|:--------|
 | `--namespace <NS>` | Target specific namespace | `--namespace production` |
 | `--label <SELECTOR>` | Filter by pod labels | `--label app=nginx` |
-| `--since <TIME>` | Logs since timestamp (RFC3339) | `--since 2024-01-01T00:00:00Z` |
+| `--since <TIME>` | Logs since timestamp (human-readable or RFC3339) | `--since 1h` or `--since 2024-01-01T00:00:00Z` |
 | `--filter <STRINGS>` | Include lines containing text | `--filter error,warning` |
 | `--threshold <FLOAT>` | Similarity threshold (0.0-1.0) | `--threshold 0.9` |
 | `--json` | Output as JSON format | `--json` |
@@ -140,6 +139,8 @@ graph LR
 | `--fetch-limit <N>` | Concurrent pod fetches | `--fetch-limit 20` |
 | `--batch-size-factor <N>` | Clustering batch multiplier | `--batch-size-factor 6` |
 | `--no-word-filter` | Disable nonsense filtering | `--no-word-filter` |
+
+> ⚠️ **Important**: Human-readable output shows only cluster representatives and counts. To see all log members within clusters, use `--json` mode with optional `--member-limit` to control the number of members displayed per cluster.
 
 ---
 
@@ -164,6 +165,9 @@ leaf --json --member-limit 10 --threshold 0.85
 ```bash
 # Focus on error logs only
 leaf --filter error,exception,failed --namespace production
+
+# Analyze errors from the last 30 minutes
+leaf --filter error --since 30m --json
 ```
 
 ### 🚀 **High-Performance Mode**
@@ -178,9 +182,24 @@ leaf --fetch-limit 25 --batch-size-factor 6 --threshold 0.75
 leaf --no-word-filter --member-limit 3
 ```
 
+### ⏰ **Time-Based Filtering**
+```bash
+# Human-readable time formats
+leaf --since 1h        # Last hour
+leaf --since 30m       # Last 30 minutes  
+leaf --since 2d        # Last 2 days
+leaf --since 1w        # Last week
+
+# Precise timestamps
+leaf --since 2024-01-01T10:00:00Z
+```
+
 ### 🏷️ **Label-Based Filtering**
 ```bash
-# Target specific application
+# Target specific application with human-readable time
+leaf --label app=webapp,tier=backend --since 1h
+
+# Using RFC3339 timestamp
 leaf --label app=webapp,tier=backend --since 2024-01-01T10:00:00Z
 ```
 
